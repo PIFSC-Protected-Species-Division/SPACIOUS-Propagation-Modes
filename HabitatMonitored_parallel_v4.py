@@ -200,7 +200,7 @@ def interpolate_sound_speed(dive_data, maxDepth, plot=False):
 
 # Worker for multiprocessing
 def _worker(task):
-    ii, subset_df, drifter_lat, drifter_lon, ssp = task
+    ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp = task
     bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset_vectorized(
         subset_df=subset_df,
         start_lat=drifter_lat,
@@ -215,6 +215,7 @@ def _worker(task):
     bathy_grid.loc[0, 'range'] = 0
     bathy = bathy_grid.apply(lambda row: [row['range'], row['depth_m']], axis=1).tolist()
 
+    # Create the enviornment
     env = pm.create_env2d(
         depth=bathy,
         soundspeed=ssp,
@@ -222,7 +223,7 @@ def _worker(task):
         bottom_absorption=0.1,
         bottom_soundspeed=5250,
         tx_depth=250,
-        frequency=3000,
+        frequency=freq_hz,
         nbeams=0,
         max_angle=90,
         min_angle=-90
@@ -265,6 +266,7 @@ bathymetry_df = pd.DataFrame({
     'lon': lon_mesh.flatten()
 })
 
+freq_hz =1000
 results = {}
 for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
     drifter_lat = group['Latitude'].iloc[0]
@@ -305,8 +307,8 @@ for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
     
     # Parallelize the Bellhop TL computations
     tasks = [
-        (ii, subset_df, drifter_lat, drifter_lon, ssp)
-        for ii in np.arange(1500, len(subset_df))]
+        (ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
+        for ii in np.arange(0, len(subset_df))]
     with ThreadPool(processes=12) as pool:
         for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, 
                                                          tasks, chunksize=5):
@@ -319,7 +321,7 @@ for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
             print(f"Processed {ii} of {total_rows} points.")
 
     save_dive_frequency(
-    h5_path      = "drift_01.h5",
+    h5_path      = "Spacious_Hawaii.h5",
     drift_id     = "01",
     dive_id      = driftId,
     freq_khz     = 1,
@@ -327,8 +329,3 @@ for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
     grid_results = results[driftId])
 
 
-#                         shape=total_dims,
-#                         chunks=chunk_dims,
-#                         dtype=storage_mode,
-#                         fillvalue=fill_value,
-#                     )
