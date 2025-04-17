@@ -20,40 +20,86 @@ from pyproj import Geod
 import h5py
 import multiprocessing
 from multiprocessing.dummy import Pool as ThreadPool
+import os
 
 #---------------------------------------------------------------------------
 # Create a Geod instance for vectorized geodesic computations.
 geod = Geod(ellps='WGS84')
 
-# This function writes all grid–point results for one dive into the HDF5 file.
-def update_dive_results_to_hdf5(filename='Test', drift='01', 
-                                dive='01', frequency='1000', 
-                                metadata=dict(), dive_results=1):
+
+def save_dive_frequency(
+        h5_path: str,
+        drift_id: str,
+        dive_id: str,
+        freq_khz: int,
+        metadata: dict,
+        grid_results: list,            # list of dicts from your thread pool
+        gzip_level: int = 4):
     """
-    Save the results for a dive to the HDF5 file under the hierarchy:
-      drift_<drift>
-        └── dive_<dive> (attributes from metadata)
-              └── frequency_<frequency>
-                    └── grid_<idx>  (each grid point result)
-                          ├── lat
-                          ├── lon
-                          ├── transmission_loss
-                          └── tl_depths
+    grid_results = [
+        {'lat': float,
+         'lon': float,
+         'transmission_loss': 1‑D np.array,
+         'tl_depths':         1‑D np.array},
+        ...
+    ]
     """
-    with h5py.File(filename, 'a') as hf:
-        drift_grp = hf.require_group(f"drift_{drift}")
-        dive_grp = drift_grp.require_group(f"dive_{dive}")
-        dive_grp.attrs['start_lat']     = metadata['start_lat']
-        dive_grp.attrs['start_lon']     = metadata['start_lon']
-        dive_grp.attrs['drifter_depth'] = metadata['drifter_depth']
-        freq_grp = dive_grp.require_group(f"frequency_{frequency}")
-        for result in dive_results:
-            grid_grp = freq_grp.create_group(f"grid_{result['idx']}")
-            grid_grp.create_dataset("lat", data=result["lat"])
-            grid_grp.create_dataset("lon", data=result["lon"])
-            grid_grp.create_dataset("transmission_loss", data=result["transmission_loss"])
-            grid_grp.create_dataset("tl_depths", data=result["tl_depths"])
-    print(f"Updated dive {dive} for drift {drift} at frequency {frequency} in file {filename}.")
+    # Number of grid pints 
+    n = len(grid_results)
+    max_N = max(len(g['tl_depths']) for g in grid_results)
+
+    # pre‑allocate and pad with NaNs
+    lat  = np.empty(n,              dtype=np.float32)
+    lon  = np.empty(n,              dtype=np.float32)
+    dmat = np.full((n, max_N), np.nan, dtype=np.float32)
+    tlmat= np.full((n, max_N), np.nan, dtype=np.float32)
+    vlen = np.empty(n, dtype=np.uint16)
+    
+    
+    for i, g in enumerate(grid_results):
+        k = len(g['tl_depths'])
+        lat[i] = g['lat']
+        lon[i] = g['lon']
+        dmat[i, :k]  = g['tl_depths']
+        tlmat[i, :k] = np.squeeze(np.round(g['transmission_loss'],2)) 
+        vlen[i] = k
+    
+    if not os.path.exists(h5_path):
+        print(f"[save_dive_frequency] creating new HDF5 file {h5_path}")
+    
+    with h5py.File(h5_path, "a") as hf:
+        fgrp = hf\
+            .require_group(f"drift_{drift_id}")\
+            .require_group(f"dive_{dive_id}")\
+            .require_group(f"frequency_{freq_khz}")
+
+        # save dive‑level attrs once
+        for k, v in metadata.items():
+            fgrp.parent.attrs[k] = v
+
+        # create or overwrite datasets
+        def _dset(name, data, **kw):
+            if name in fgrp:
+                del fgrp[name]
+            fgrp.create_dataset(
+                name,
+                data=data,
+                compression="gzip",
+                compression_opts=gzip_level,
+                chunks=kw.get("chunks"))
+
+        _dset("lat",  lat)
+        _dset("lon",  lon)
+        _dset("valid_len", vlen)
+        
+        # --- choose chunk dims: each <= data dims ---------------------
+        row_chunk = min(256, n)        # never exceed #rows
+        col_chunk = max_N              # always valid: max_N == depth.shape[1]
+        
+        _dset("depth", dmat, chunks=(row_chunk, col_chunk))
+        _dset("tl",    tlmat,    chunks=(row_chunk, col_chunk))
+
+
 
 def haversine(lon1, lat1, lon2, lat2):
     """
@@ -251,13 +297,19 @@ for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
     profile['ss'] = np.abs(profile['ss'])
     ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
 
+
+    # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
+    metadata = {'start_lat': drifter_lat,
+                    'start_lon': drifter_lon,
+                    'drifter_depth': 250}
+    
     # Parallelize the Bellhop TL computations
     tasks = [
         (ii, subset_df, drifter_lat, drifter_lon, ssp)
-        for ii in np.arange(740, len(subset_df))
-    ]
-    with ThreadPool(processes=4) as pool:
-        for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, tasks, chunksize=1):
+        for ii in np.arange(1500, len(subset_df))]
+    with ThreadPool(processes=12) as pool:
+        for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, 
+                                                         tasks, chunksize=5):
             results[driftId].append({
                 'lat':               drifter_lat,
                 'lon':               drifter_lon,
@@ -265,3 +317,18 @@ for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
                 'tl_depths':         rx_depths
             })
             print(f"Processed {ii} of {total_rows} points.")
+
+    save_dive_frequency(
+    h5_path      = "drift_01.h5",
+    drift_id     = "01",
+    dive_id      = driftId,
+    freq_khz     = 1,
+    metadata     = metadata,
+    grid_results = results[driftId])
+
+
+#                         shape=total_dims,
+#                         chunks=chunk_dims,
+#                         dtype=storage_mode,
+#                         fillvalue=fill_value,
+#                     )
