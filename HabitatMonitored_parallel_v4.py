@@ -239,6 +239,9 @@ def _worker(task):
 ############################################################################
 #%% Run the analysis
 
+# Determine the number of workers on the machine. Leave 2 cpus for sanity.
+nWorkers = multiprocessing.cpu_count()-2
+
 # Load a drift
 driftCTD = pd.read_csv("C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
 
@@ -266,7 +269,7 @@ bathymetry_df = pd.DataFrame({
     'lon': lon_mesh.flatten()
 })
 
-freq_hz =1000
+freq_hz =15000
 results = {}
 for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
     drifter_lat = group['Latitude'].iloc[0]
@@ -277,55 +280,63 @@ for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
         bathymetry_df['lon'], bathymetry_df['lat']
     )
     subset_df = bathymetry_df[
-        (bathymetry_df['distance_km'] <= 10) &
+        (bathymetry_df['distance_km'] <= 15) &
         (bathymetry_df['distance_km'] > 1.1)
     ]
 
     total_rows = len(subset_df)
     results[driftId] = []
 
+    
     # Create the SSP profile
     profile = pd.DataFrame({
-        'depth': group['Depth_m'][group['Direction'] == 'asc'],
-        'ss':    group['SoundSpeed_m_s'][group['Direction'] == 'asc']
+        'depth': group['Depth_m'],
+        'ss':    group['SoundSpeed_m_s']
     })
     profile.sort_values('depth', inplace=True)
     profile.dropna(inplace=True)
     profile.reset_index(drop=True, inplace=True)
     profile.loc[0, 'depth'] = 0
-    max_depth = np.max(np.abs(subset_df['depth']))
-    last_ss = profile.iloc[-1]['ss']
-    profile.loc[profile.index.max() + 1] = [max_depth, last_ss]
-    profile['ss'] = np.abs(profile['ss'])
-    ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
-
-
-    # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
-    metadata = {'start_lat': drifter_lat,
-                    'start_lon': drifter_lon,
-                    'drifter_depth': 250}
     
-    # Parallelize the Bellhop TL computations
-    tasks = [
-        (ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
-        for ii in np.arange(0, len(subset_df))]
-    with ThreadPool(processes=12) as pool:
-        for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, 
-                                                         tasks, chunksize=5):
-            results[driftId].append({
-                'lat':               drifter_lat,
-                'lon':               drifter_lon,
-                'transmission_loss': tlosDb,
-                'tl_depths':         rx_depths
-            })
-            print(f"Processed {ii} of {total_rows} points.")
-
-    save_dive_frequency(
-    h5_path      = "Spacious_Hawaii.h5",
-    drift_id     = "01",
-    dive_id      = driftId,
-    freq_khz     = 1,
-    metadata     = metadata,
-    grid_results = results[driftId])
+    # Only use the dive if the profile length is >60 rows long
+    
+    if profile.shape[0]>60:
+        print(f'Running dive Id {driftId}  at {freq_hz} kHz')
+        max_depth = np.max(np.abs(subset_df['depth']))
+        last_ss = profile.iloc[-1]['ss']
+        profile.loc[profile.index.max() + 1] = [max_depth, last_ss]
+        profile['ss'] = np.abs(profile['ss'])
+        ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
+    
+    
+        # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
+        metadata = {'start_lat': drifter_lat,
+                        'start_lon': drifter_lon,
+                        'drifter_depth': 250}
+        
+        # Parallelize the Bellhop TL computations
+        tasks = [
+            (ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
+            for ii in np.arange(0, len(subset_df))]
+        
+        # Inputs vectorized, run the analysis
+        with ThreadPool(processes= nWorkers) as pool:
+            for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, 
+                                                             tasks, chunksize=5):
+                results[driftId].append({
+                    'lat':               drifter_lat,
+                    'lon':               drifter_lon,
+                    'transmission_loss': tlosDb,
+                    'tl_depths':         rx_depths
+                })
+                print(f"Processed {ii} of {total_rows} points.")
+    
+        save_dive_frequency(
+        h5_path      = "Spacious_Hawaii_250m.h5",
+        drift_id     = "01",
+        dive_id      = driftId,
+        freq_khz     = 1,
+        metadata     = metadata,
+        grid_results = results[driftId])
 
 
