@@ -317,9 +317,7 @@ def _worker(task):
     # Env checking
     #pm.check_env2d(env)
     
-    tlosDb =5
-    
-    
+
     print(f'done! {ii}')
     return ii, tlosDb, env['rx_depth']
 
@@ -378,7 +376,6 @@ bathymetry_df = pd.DataFrame({
     'lon': lon_mesh.flatten()})
 
 freq_hz =10000
-results = {}
 
 
 # Existing partially written HF5 file
@@ -386,7 +383,7 @@ results = {}
 unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
 
 # 2) loop from the third element onward (index 2, because Python is zero‑based)
-for driftId in unique_ids[0:]:
+for driftId in unique_ids[0:12]:
     # 3) pull out the corresponding group “on the fly”
     group = driftCTD[driftCTD['DiveID'] == driftId]
     print(driftId)
@@ -417,7 +414,7 @@ for driftId in unique_ids[0:]:
         #subset_df = subset_df[subset_df.index % 3 != 0] 
     
         total_rows = len(subset_df)
-        results[driftId] = []
+        
     
         
         # Create the SSP profile
@@ -432,6 +429,9 @@ for driftId in unique_ids[0:]:
         
         # Only use the dive if the profile depth is more than 200m
         if np.max(profile['depth'])>200:
+            results = {}
+            results[driftId] = []
+
             print(f'Running dive Id {driftId}  at {freq_hz} kHz')
             max_depth = np.max(np.abs(subset_df['depth']))
             last_ss = profile.iloc[-1]['ss']
@@ -455,9 +455,9 @@ for driftId in unique_ids[0:]:
                             'drifter_depth': 250}
             
     
-            for ii in np.arange(807, len(subset_df)):        
-                checkEnv(ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
-                print(f"sucess {ii} dive {driftId}" )
+            # for ii in np.arange(807, len(subset_df)):        
+            #     checkEnv(ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
+            #     print(f"sucess {ii} dive {driftId}" )
     
             # Parallelize the Bellhop TL computations
             tasks = [
@@ -496,7 +496,7 @@ for driftId in unique_ids[0:]:
             #         print(f"Processed {ii} of {total_rows} points.")
         
             save_dive_frequency(
-            h5_path      = "Spacious_Hawaii_250m.h5",
+            h5_path      = "Spacious_Hawaii_250m_v0.h5",
             drift_id     = "01",
             dive_id      = driftId,
             freq_khz     = freq_hz,
