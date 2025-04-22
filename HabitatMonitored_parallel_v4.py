@@ -4,7 +4,8 @@ Created on Wed Apr  9 20:24:37 2025
 
 @author: kaity
 """
-
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "16"   # or 1, 8 … anything ≤ 24
 import numpy as np
 from geopy.distance import geodesic
 from geopy.point import Point
@@ -20,7 +21,9 @@ from pyproj import Geod
 import h5py
 import multiprocessing
 from multiprocessing.dummy import Pool as ThreadPool
-import os
+
+
+
 
 #---------------------------------------------------------------------------
 # Create a Geod instance for vectorized geodesic computations.
@@ -198,9 +201,11 @@ def interpolate_sound_speed(dive_data, maxDepth, plot=False):
     )
     return pd.DataFrame({'Depth_m': depth_range, 'SoundSpeed_m_s': sound_speed_interp})
 
-# Worker for multiprocessing
-def _worker(task):
-    ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp = task
+
+def checkEnv(ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp):
+    '''Function to check that all of the enviornmental parameters are set up
+    correctly
+    '''
     bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset_vectorized(
         subset_df=subset_df,
         start_lat=drifter_lat,
@@ -209,7 +214,41 @@ def _worker(task):
         stop_lon=subset_df['lon'].iloc[ii],
         interval=200
     )
-    bathy_grid = pd.DataFrame({'range': cumulative_distance * 1000, 'depth_m': -bathy_vals})
+    bathy_grid = pd.DataFrame({'range': cumulative_distance * 1000, 
+                               'depth_m': -bathy_vals})
+    bathy_grid.drop_duplicates(inplace=True)
+    bathy_grid.sort_values('range', inplace=True)
+    bathy_grid.loc[0, 'range'] = 0
+    bathy = bathy_grid.apply(lambda row: [row['range'], row['depth_m']], axis=1).tolist()
+
+    # Create the enviornment
+    env = pm.create_env2d(
+        depth=bathy,
+        soundspeed=ssp,
+        bottom_density=2700,    # kg/m^3
+        bottom_absorption=0.1,
+        bottom_soundspeed=5250,
+        tx_depth=250,
+        frequency=freq_hz,
+        nbeams=0,
+        max_angle=90,
+        min_angle=-90
+    )
+    env['rx_range'] = bathy_grid['range'].iloc[-1]
+    env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[-1], 50)
+    pm.check_env2d(env)
+
+def calcTL(ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp):
+    bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset_vectorized(
+        subset_df=subset_df,
+        start_lat=drifter_lat,
+        start_lon=drifter_lon,
+        stop_lat=subset_df['lat'].iloc[ii],
+        stop_lon=subset_df['lon'].iloc[ii],
+        interval=200
+    )
+    bathy_grid = pd.DataFrame({'range': cumulative_distance * 1000, 
+                               'depth_m': -bathy_vals})
     bathy_grid.drop_duplicates(inplace=True)
     bathy_grid.sort_values('range', inplace=True)
     bathy_grid.loc[0, 'range'] = 0
@@ -233,14 +272,84 @@ def _worker(task):
     tloss = pm.compute_transmission_loss(env, mode='incoherent')
     tlosDb = 20 * np.log10(np.abs(tloss))
     
-    print('')
+    print(f'done! {ii}')
+    return(tlosDb)
+
+
+# Worker for multiprocessing
+def _worker(task):
+    ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp = task
+    
+    print(f'Starting index {ii}')
+    bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset_vectorized(
+        subset_df=subset_df,
+        start_lat=drifter_lat,
+        start_lon=drifter_lon,
+        stop_lat=subset_df['lat'].iloc[ii],
+        stop_lon=subset_df['lon'].iloc[ii],
+        interval=200
+    )
+    bathy_grid = pd.DataFrame({'range': cumulative_distance * 1000, 
+                               'depth_m': -bathy_vals})
+    bathy_grid.drop_duplicates(inplace=True)
+    bathy_grid.sort_values('range', inplace=True)
+    bathy_grid.loc[0, 'range'] = 0
+    bathy = bathy_grid.apply(lambda row: [row['range'], row['depth_m']], axis=1).tolist()
+
+    # Create the enviornment
+    env = pm.create_env2d(
+        depth=bathy,
+        soundspeed=ssp,
+        bottom_density=2700,    # kg/m^3
+        bottom_absorption=0.1,
+        bottom_soundspeed=5250,
+        tx_depth=250,
+        frequency=freq_hz,
+        nbeams=0,
+        max_angle=90,
+        min_angle=-90
+    )
+    env['rx_range'] = bathy_grid['range'].iloc[-1]
+    env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[-1], 50)
+    tloss = pm.compute_transmission_loss(env, mode='incoherent')
+    tlosDb = 20 * np.log10(np.abs(tloss))
+    
+    # Env checking
+    #pm.check_env2d(env)
+    
+    tlosDb =5
+    
+    
+    print(f'done! {ii}')
     return ii, tlosDb, env['rx_depth']
+
+
+from multiprocessing.pool import ThreadPool
+import traceback   # optional, if you want full stack traces
+
+def _safe_worker(args):
+    """
+    Run _worker(args) but never let an exception kill the pool.
+    If _worker succeeds     → return ('ok',   ii, result_tuple)
+    If _worker raises error → return ('fail', ii, exc)
+    """
+    ii = args[0]           # first element is your index
+    try:
+        # _worker should return (ii, tlosDb, rx_depths)
+        res = _worker(args)
+        return ('ok', ii, res)
+    except Exception as exc:
+        # Uncomment next line if you want the full traceback printed
+        traceback.print_exc()
+        return ('fail', ii, exc)
+
 
 ############################################################################
 #%% Run the analysis
 
 # Determine the number of workers on the machine. Leave 2 cpus for sanity.
-nWorkers = multiprocessing.cpu_count()-2
+nWorkers = multiprocessing.cpu_count()-3
+
 
 # Load a drift
 driftCTD = pd.read_csv("C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
@@ -266,77 +375,132 @@ lon_mesh, lat_mesh = np.meshgrid(lonvec, latvec)
 bathymetry_df = pd.DataFrame({
     'depth': depth2d.flatten(),
     'lat': lat_mesh.flatten(),
-    'lon': lon_mesh.flatten()
-})
+    'lon': lon_mesh.flatten()})
 
-freq_hz =15000
+freq_hz =10000
 results = {}
-for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=0):
-    drifter_lat = group['Latitude'].iloc[0]
-    drifter_lon = group['Longitude'].iloc[0]
 
-    bathymetry_df['distance_km'] = haversine(
-        drifter_lon, drifter_lat,
-        bathymetry_df['lon'], bathymetry_df['lat']
-    )
-    subset_df = bathymetry_df[
-        (bathymetry_df['distance_km'] <= 15) &
-        (bathymetry_df['distance_km'] > 1.1)
-    ]
 
-    total_rows = len(subset_df)
-    results[driftId] = []
+# Existing partially written HF5 file
+#hf = h5py.File('Spacious_Hawaii_250m_v1.h5', 'r')
+unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
 
+# 2) loop from the third element onward (index 2, because Python is zero‑based)
+for driftId in unique_ids[0:]:
+    # 3) pull out the corresponding group “on the fly”
+    group = driftCTD[driftCTD['DiveID'] == driftId]
+    print(driftId)
     
-    # Create the SSP profile
-    profile = pd.DataFrame({
-        'depth': group['Depth_m'],
-        'ss':    group['SoundSpeed_m_s']
-    })
-    profile.sort_values('depth', inplace=True)
-    profile.dropna(inplace=True)
-    profile.reset_index(drop=True, inplace=True)
-    profile.loc[0, 'depth'] = 0
-    
-    # Only use the dive if the profile length is >60 rows long
-    
-    if profile.shape[0]>60:
-        print(f'Running dive Id {driftId}  at {freq_hz} kHz')
-        max_depth = np.max(np.abs(subset_df['depth']))
-        last_ss = profile.iloc[-1]['ss']
-        profile.loc[profile.index.max() + 1] = [max_depth, last_ss]
-        profile['ss'] = np.abs(profile['ss'])
-        ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
-    
-    
-        # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
-        metadata = {'start_lat': drifter_lat,
-                        'start_lon': drifter_lon,
-                        'drifter_depth': 250}
+    #if driftId not in hf['drift_01'].keys():
+    #if driftId == '1_dec':
+    if (1+1) ==2:   
+
+        drifter_lat = group['Latitude'].iloc[0]
+        drifter_lon = group['Longitude'].iloc[0]
         
-        # Parallelize the Bellhop TL computations
-        tasks = [
-            (ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
-            for ii in np.arange(0, len(subset_df))]
-        
-        # Inputs vectorized, run the analysis
-        with ThreadPool(processes= nWorkers) as pool:
-            for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, 
-                                                             tasks, chunksize=5):
-                results[driftId].append({
-                    'lat':               drifter_lat,
-                    'lon':               drifter_lon,
-                    'transmission_loss': tlosDb,
-                    'tl_depths':         rx_depths
-                })
-                print(f"Processed {ii} of {total_rows} points.")
+       
     
-        save_dive_frequency(
-        h5_path      = "Spacious_Hawaii_250m.h5",
-        drift_id     = "01",
-        dive_id      = driftId,
-        freq_khz     = 1,
-        metadata     = metadata,
-        grid_results = results[driftId])
+        bathymetry_df['distance_km'] = haversine(
+            drifter_lon, drifter_lat,
+            bathymetry_df['lon'], bathymetry_df['lat']
+        )
+        
+        # Pull out datapoints within 15k of the sensor and deeper than 20m
+        subset_df = bathymetry_df[
+            (bathymetry_df['distance_km'] <= 15) &
+            (bathymetry_df['distance_km'] > 1.1) &
+            (bathymetry_df['depth'] < -20) 
+            
+        ]
+        
+        # Downsample the datapoints by 1/3
+        #subset_df = subset_df[subset_df.index % 3 != 0] 
+    
+        total_rows = len(subset_df)
+        results[driftId] = []
+    
+        
+        # Create the SSP profile
+        profile = pd.DataFrame({
+            'depth': group['Depth_m'],
+            'ss':    group['SoundSpeed_m_s']
+        })
+        profile.sort_values('depth', inplace=True)
+        profile.dropna(inplace=True)
+        profile.reset_index(drop=True, inplace=True)
+        profile.loc[0, 'depth'] = 0
+        
+        # Only use the dive if the profile depth is more than 200m
+        if np.max(profile['depth'])>200:
+            print(f'Running dive Id {driftId}  at {freq_hz} kHz')
+            max_depth = np.max(np.abs(subset_df['depth']))
+            last_ss = profile.iloc[-1]['ss']
+            
+            
+            expanedProfile = pd.DataFrame(
+                {'depth': np.arange(profile.iloc[-1]['depth']+1, max_depth+50, step =50),
+                    'ss': np.repeat(last_ss,
+                                    len(np.arange(profile.iloc[-1]['depth']+10, max_depth+50, step =50)))})
+    
+    
+            profile = pd.concat([profile, expanedProfile])
+            profile['ss'] = np.abs(profile['ss'])
+            profile.sort_values('depth', inplace=True)
+            ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
+        
+        
+            # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
+            metadata = {'start_lat': drifter_lat,
+                            'start_lon': drifter_lon,
+                            'drifter_depth': 250}
+            
+    
+            for ii in np.arange(807, len(subset_df)):        
+                checkEnv(ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
+                print(f"sucess {ii} dive {driftId}" )
+    
+            # Parallelize the Bellhop TL computations
+            tasks = [
+                (ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp)
+                for ii in np.arange(0, len(subset_df))]
+            
+            with ThreadPool(processes=nWorkers) as pool:
+                for status, ii, payload in pool.imap_unordered(_safe_worker,
+                                                               tasks,
+                                                               chunksize=5):
+                    if status == 'fail':
+                        #                         ↓ or logging.warning(...)
+                        print(f"❌  error at index {ii}: {payload}")
+                        continue                 # skip to next task
+            
+                    # success path ------------------------------------------------
+                    _, tlosDb, rx_depths = payload   # unpack the worker result
+                    results[driftId].append({
+                        'lat':               subset_df['lat'].iloc[ii],
+                        'lon':               subset_df['lon'].iloc[ii],
+                        'transmission_loss': tlosDb,
+                        'tl_depths':         rx_depths
+                    })
+                    print(f"Processed {ii} of {total_rows} points.")    
+            # # Inputs vectorized, run the analysis
+            # with ThreadPool(processes= nWorkers) as pool:
+            #     for ii, tlosDb, rx_depths in pool.imap_unordered(_worker, 
+            #                                                      tasks, 
+            #                                                      chunksize=5):
+            #         results[driftId].append({
+            #             'lat':               drifter_lat,
+            #             'lon':               drifter_lon,
+            #             'transmission_loss': tlosDb,
+            #             'tl_depths':         rx_depths
+            #         })
+            #         print(f"Processed {ii} of {total_rows} points.")
+        
+            save_dive_frequency(
+            h5_path      = "Spacious_Hawaii_250m.h5",
+            drift_id     = "01",
+            dive_id      = driftId,
+            freq_khz     = freq_hz,
+            metadata     = metadata,
+            grid_results = results[driftId])
 
 
