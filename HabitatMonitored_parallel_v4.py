@@ -383,7 +383,7 @@ freq_hz =10000
 unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
 
 # 2) loop from the third element onward (index 2, because Python is zero‑based)
-for driftId in unique_ids[0:12]:
+for driftId in unique_ids[11:]:
     # 3) pull out the corresponding group “on the fly”
     group = driftCTD[driftCTD['DiveID'] == driftId]
     print(driftId)
