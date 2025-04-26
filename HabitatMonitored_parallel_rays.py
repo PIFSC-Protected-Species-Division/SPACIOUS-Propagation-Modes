@@ -562,7 +562,7 @@ def _safe_worker(args):
 
 if __name__ == "__main__":
     # Determine the number of workers on the machine. Leave 2 cpus for sanity.
-    nWorkers = multiprocessing.cpu_count()-3
+    nWorkers = multiprocessing.cpu_count()-2
     
     maxRangekm = 40
     # Load a drift
