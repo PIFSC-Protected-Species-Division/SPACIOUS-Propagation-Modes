@@ -4,8 +4,23 @@ Created on Wed Apr  9 20:24:37 2025
 
 @author: kaity
 """
+
+# --- put these four lines at the VERY top, before any other imports -------------
 import os
-os.environ["OPENBLAS_NUM_THREADS"] = "16"   # or 1, 8 … anything ≤ 24
+#os.environ["OPENBLAS_NUM_THREADS"] = "16"   # or 1, 8 … anything ≤ 24
+# os.environ["OPENBLAS_NUM_THREADS"] = "3"
+# os.environ["OMP_NUM_THREADS"]      = "3"
+# os.environ["MKL_NUM_THREADS"]      = "3"
+
+import os, multiprocessing
+vcpus        = multiprocessing.cpu_count()      # 16
+N_pool       = 6                                # four Bellhop jobs in parallel
+N_blas       = 6                                # four BLAS threads each
+os.environ["OPENBLAS_NUM_THREADS"] = str(N_blas)
+os.environ["OMP_NUM_THREADS"]      = str(N_blas)
+os.environ["MKL_NUM_THREADS"]      = str(N_blas)   # if you switch BLAS later
+# -------------------------------------------------------------------------------
+
 import numpy as np
 from geopy.distance import geodesic
 from geopy.point import Point
@@ -32,6 +47,7 @@ import time
 # Globals shared by all threads (ThreadPool → threads share memory)
 # ------------------------------------------------------------------ #
 bathy_full = None        # set once in main
+subset_df = None
 geod       = Geod(ellps='WGS84')
 
 def variable_rx_range(max_km, s0_km=0.2, s1_km=0.1, target_km=40):
@@ -303,10 +319,10 @@ def calcTL(subset_df, drifter_lat, drifter_lon, freq_hz, bearing_deg,
     #pm.check_env2d(env)
     #pm.plot_ssp(env)
     
-    t = time.time()
-    tloss = pm.compute_transmission_loss(env, mode='coherent')
-    elapsed = time.time() - t
-    tlosDb = 20 * np.log10(np.abs(tloss)+.01)
+    #t = time.time()
+    tloss = pm.compute_transmission_loss(env, mode='incoherent')
+    #elapsed = time.time() - t
+    tlosDb = 20 * np.log10(np.abs(tloss))
     #pm.plot_transmission_loss(tloss, env=env, clim=[-90,-30], width=900)
     
    
@@ -431,7 +447,7 @@ def extract_bathymetry_along_ray_vectorized(
 # Worker for multiprocessing
 def _worker(args):
     (angle_deg,              # <- was “ii”, keeps the bearing / task-ID
-     subset_df,
+     #subset_df,
      drifter_lat,
      drifter_lon,
      freq_hz,
@@ -600,7 +616,7 @@ if __name__ == "__main__":
     
     
     # 2) loop from the third element onward (index 2, because Python is zero‑based)
-    for driftId in unique_ids[0:16]:
+    for driftId in unique_ids[0:]:
         # 3) pull out the corresponding group “on the fly”
         group = driftCTD[driftCTD['DiveID'] == driftId]
         print(driftId)
@@ -650,7 +666,7 @@ if __name__ == "__main__":
                 
                 
                 expanedProfile = pd.DataFrame(
-                    {'depth': np.arange(profile.iloc[-1]['depth']+1, max_depth+50, step =50),
+                    {'depth': np.arange(profile.iloc[-1]['depth']+10, max_depth+50, step =50),
                         'ss': np.repeat(last_ss,
                                         len(np.arange(profile.iloc[-1]['depth']+10, max_depth+50, step =50)))})
         
@@ -673,32 +689,32 @@ if __name__ == "__main__":
                 hydHorzSpacing = 100
                 interval = 100 #bathymetry spacing
         
-                # # For each bearing angle 
-                # for ii in np.arange(90,359, step =90):
-                #     print(f'starting angle {ii}')
-                #     tlGrid, range_m, depth_m = calcTL(subset_df, drifter_lat, drifter_lon, freq_hz, 
-                #            ii, interval, hydVertSpacing, 
-                #            hydHorzSpacing, max_distance_km, ssp)
+                # For each bearing angle 
+                for ii in np.arange(0,359, step =90):
+                    print(f'starting angle {ii}')
+                    tlGrid, range_m, depth_m = calcTL(subset_df, drifter_lat, drifter_lon, freq_hz, 
+                           ii, interval, hydVertSpacing, 
+                           hydHorzSpacing, max_distance_km, ssp)
                     
-                #     results[driftId].append({
-                #         'range_m':              range_m,
-                #         'depth_m':              depth_m,
-                #         'transmission_loss':    tlGrid,
-                #         'angle':ii
-                #     })
-                # print(f"Processed {ii} of 360 {driftId}")
+                    results[driftId].append({
+                        'range_m':              range_m,
+                        'depth_m':              depth_m,
+                        'transmission_loss':    tlGrid,
+                        'angle':ii
+                    })
+                print(f"Processed {ii} of 360 {driftId}")
 
                 nSteps = 360
                 # Parallelize the Bellhop TL computations
                 tasks = [
-                    (angle, subset_df, drifter_lat, drifter_lon, freq_hz, ssp, txDepth,
+                    (angle, drifter_lat, drifter_lon, freq_hz, ssp, txDepth,
                      maxRangekm, interval, hydVertSpacing)
                     for angle in np.arange(0, 359, step = 1)]
                                 
                 with ThreadPool(processes=nWorkers) as pool:
                     for status, ii, payload in pool.imap_unordered(_safe_worker,
                                                                    tasks,
-                                                                   chunksize=5):
+                                                                   chunksize=1):
                         if status == 'fail':
                             #                         ↓ or logging.warning(...)
                             print(f"❌  error at index {ii}: {payload}")
