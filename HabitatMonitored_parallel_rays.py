@@ -12,14 +12,26 @@ import os
 # os.environ["OMP_NUM_THREADS"]      = "3"
 # os.environ["MKL_NUM_THREADS"]      = "3"
 
-import os, multiprocessing
-vcpus        = multiprocessing.cpu_count()      # 16
-N_pool       = 3                                # four Bellhop jobs in parallel
-N_blas       = 3                                # four BLAS threads each
-os.environ["OPENBLAS_NUM_THREADS"] = str(N_blas)
-os.environ["OMP_NUM_THREADS"]      = str(N_blas)
-os.environ["MKL_NUM_THREADS"]      = str(N_blas)   # if you switch BLAS later
-# -------------------------------------------------------------------------------
+# import os, multiprocessing
+# cores = 60
+# N_POOL = max(2, cores // 3)   # → 20
+# N_BLAS = 1
+
+# # apply globally
+# os.environ["OMP_NUM_THREADS"]      = str(N_BLAS)
+# os.environ["OPENBLAS_NUM_THREADS"] = str(N_BLAS)
+# os.environ["MKL_NUM_THREADS"]      = str(N_BLAS)
+
+import multiprocessing as mp
+
+cores  = 58           # or mp.cpu_count()
+N_POOL = cores        # → 60 parallel workers
+N_BLAS = 1            # each worker only spawns 1 BLAS thread
+
+for var in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS"):
+    os.environ[var] = str(N_BLAS)
+
+from multiprocessing.pool import ThreadPool   # import *after* setting env
 
 from operator import itemgetter   # a tiny bit faster than a lambda
 import numpy as np
@@ -419,10 +431,11 @@ def extract_bathymetry_along_ray_vectorized(
     )
 
     # ------------------------------------------------ 3. CUMULATIVE RANGE (km)
-    start_point = Point(start_lat, start_lon)
-    range_km = np.array(
-        [geodesic(start_point, (lat, lon)).kilometers for lat, lon in zip(lats, lons)]
-    )
+    #start_point = Point(start_lat, start_lon)
+    # range_km = np.array(
+    #     [geodesic(start_point, (lat, lon)).kilometers for lat, lon in zip(lats, lons)]
+    # )
+    range_km = distances_m / 1000.0
 
     # ------------------------------------------------ 4. INTERPOLATE BATHYMETRY
     subset_points  = subset_df[["lat", "lon"]].values
@@ -616,7 +629,7 @@ if __name__ == "__main__":
     # Existing partially written HF5 file
     unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
     
-    max_distance_km = 40 
+    
     hydVertSpacing = 75
     hydHorzSpacing = 100
     interval = 100 #bathymetry spacing
@@ -626,11 +639,8 @@ if __name__ == "__main__":
     stepInt = 360/nSteps
     
     
-    
-    
-    
     # 2) loop from the third element onward (index 2, because Python is zero‑based)
-    for driftId in unique_ids[0:]:
+    for driftId in unique_ids[13:]:
         # 3) pull out the corresponding group “on the fly”
         group = driftCTD[driftCTD['DiveID'] == driftId]
         print(driftId)
@@ -666,6 +676,7 @@ if __name__ == "__main__":
         profile.reset_index(drop=True, inplace=True)
         profile.loc[0, 'depth'] = 0
         
+        t = time.time()
         # Only use the dive if the profile depth is more than 200m
         if np.max(profile['depth'])>200:
             
@@ -674,8 +685,10 @@ if __name__ == "__main__":
                 results = {}
                 results[driftId] = []
                 t = time.time()
-                
-    
+
+                max_distance_km = (45000-freq)/1000
+               
+                    
                 print(f'Running dive Id {driftId}  at {freq_hz} kHz')
                 max_depth = np.max(np.abs(subset_df['depth']))
                 last_ss = profile.iloc[-1]['ss']
@@ -722,11 +735,16 @@ if __name__ == "__main__":
                     (angle, drifter_lat, drifter_lon, freq, ssp, txDepth,
                      maxRangekm, interval, hydVertSpacing)
                     for angle in np.int16(np.arange(0, 360, step = stepInt))]
-                                
-                with ThreadPool(processes=nWorkers) as pool:
+                
+                with ThreadPool(processes=N_POOL) as pool:
                     for status, ii, payload in pool.imap_unordered(_safe_worker,
-                                                                   tasks,
-                                                                   chunksize=1):
+                                                   tasks,
+                                                   chunksize=2):
+                                
+                # with ThreadPool(processes=nWorkers) as pool:
+                #     for status, ii, payload in pool.imap_unordered(_safe_worker,
+                #                                                    tasks,
+                #                                                    chunksize=1):
                         if status == 'fail':
                             #                         ↓ or logging.warning(...)
                             print(f"❌  error at index {ii}: {payload}")
