@@ -15,8 +15,57 @@ import pandas as pd
 from scipy.interpolate import griddata
 import arlpy.uwapm as pm
 import arlpy.plot as arlplt
+import matplotlib.tri as tri
+from pyproj import Geod
 
+import h5py
+#---------------------------------------------------------------------------
 
+# Create a Geod instance for vectorized geodesic computations.
+geod = Geod(ellps='WGS84')
+#This function writes all grid–point results for one dive into the HDF5 file.
+def update_dive_results_to_hdf5(filename = 'Test', drift ='01', 
+                                dive = '01', frequency ='1000', 
+                                metadata = dict(), dive_results = 1):
+    """
+    Save the results for a dive to the HDF5 file under the hierarchy:
+      drift_<drift>
+        └── dive_<dive> (attributes from metadata)
+              └── frequency_<frequency>
+                    └── grid_<idx>  (each grid point result)
+                          ├── lat
+                          ├── lon
+                          ├── transmission_loss
+                          └── tl_depths
+                          
+    Parameters:
+      filename (str): The HDF5 file name (e.g. "drift_1.h5").
+      drift (int or str): Identifier for the drift.
+      dive (int or str): Identifier for the dive.
+      frequency (numeric): The simulation frequency for this dive.
+      metadata (dict): Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
+      dive_results (list): List of dictionaries with keys 'idx', 'lat', 'lon',
+                           'transmission_loss', and 'tl_depths'.
+    """
+    with h5py.File(filename, 'a') as hf:
+        # Create or get the drift group.
+        drift_grp = hf.require_group(f"drift_{drift}")
+        # Create or get the dive group and set/update its attributes.
+        dive_grp = drift_grp.require_group(f"dive_{dive}")
+        dive_grp.attrs['start_lat'] = metadata['start_lat']
+        dive_grp.attrs['start_lon'] = metadata['start_lon']
+        dive_grp.attrs['drifter_depth'] = metadata['drifter_depth']
+        # Create or get the frequency group.
+        freq_grp = dive_grp.require_group(f"frequency_{frequency}")
+        
+        # Iterate over each grid point result and store it.
+        for result in dive_results:
+            grid_grp = freq_grp.create_group(f"grid_{result['idx']}")
+            grid_grp.create_dataset("lat", data=result["lat"])
+            grid_grp.create_dataset("lon", data=result["lon"])
+            grid_grp.create_dataset("transmission_loss", data=result["transmission_loss"])
+            grid_grp.create_dataset("tl_depths", data=result["tl_depths"])
+    print(f"Updated dive {dive} for drift {drift} at frequency {frequency} in file {filename}.")
 
 def haversine(lon1, lat1, lon2, lat2):
     """
@@ -150,6 +199,57 @@ def extract_bathymetry_from_subset(subset_df, start_lat, start_lon, stop_lat, st
     return bathymetry_values, path_lons, path_lats, range_km
 
 
+def extract_bathymetry_from_subset_vectorized(
+    subset_df: pd.DataFrame,
+    start_lat: float,
+    start_lon: float,
+    stop_lat: float,
+    stop_lon: float,
+    interval: float):
+    """
+    Compute bathymetry along the path from (start_lat, start_lon) to (stop_lat, stop_lon)
+    at a specified interval (in meters) using a vectorized computation of destination 
+    coordinates and a geopy-based calculation of cumulative distances.
+    
+    Returns:
+      - bathymetry_values: interpolated depth values along the path.
+      - path_lons: array of longitudes along the path.
+      - path_lats: array of latitudes along the path.
+      - range_km: array of cumulative distances (in kilometers) from the start.
+      
+    This function uses pyproj.fwd for speed but calculates cumulative distances with geopy.
+    """
+    total_distance_km = geodesic((start_lat, start_lon), (stop_lat, stop_lon)).kilometers
+    interval_km = interval / 1000.0
+    
+    
+    num_points = max(int(total_distance_km / interval_km), 1)
+    bearing = calculate_initial_compass_bearing((start_lat, start_lon), (stop_lat, stop_lon))
+    
+    # Create the distance array
+    distances_m = np.linspace(0, total_distance_km * 1000, num_points + 1)
+    lons, lats, _ = geod.fwd(
+        np.full_like(distances_m, start_lon),
+        np.full_like(distances_m, start_lat),
+        np.full_like(distances_m, bearing),
+        distances_m
+    )
+    start_point = Point(start_lat, start_lon)
+    
+    range_km = np.array([geodesic(start_point, (lat, lon)).kilometers for lat, lon in zip(lats, lons)])
+    subset_points = subset_df[['lat', 'lon']].values
+    subset_depths = subset_df['depth'].values
+    path_points = np.column_stack((lats, lons))
+    
+    # Compile the bathymetry points into something that Bellhop is expecting
+    bathymetry_values = griddata(subset_points, subset_depths, path_points, method='linear')
+    if np.any(np.isnan(bathymetry_values)):
+        nan_mask = np.isnan(bathymetry_values)
+        bathymetry_values[nan_mask] = griddata(
+            subset_points, subset_depths, path_points[nan_mask], method='nearest'
+        )
+    return bathymetry_values, lons, lats, range_km
+
 # Function to interpolate sound speed for each meter of depth
 def interpolate_sound_speed(dive_data, maxDepth, plot =False):
     # Sorting by depth might be necessary if not already sorted
@@ -164,21 +264,21 @@ def interpolate_sound_speed(dive_data, maxDepth, plot =False):
     # Predict sound speed at these depths using the spline
     sound_speed_interp = np.interp(depth_range, dive_data_sorted['Depth_m'],
                                    dive_data_sorted['SoundSpeed_m_s'])
-    if plot:
-        # Plotting
-        plt.figure(figsize=(3, 10))
-        plt.plot(dive_data_sorted['SoundSpeed_m_s'], 
-                 dive_data_sorted['Depth_m'],  'ro', 
-                 label=f'Original Data ({dive_id})')
-        plt.plot(sound_speed_interp, depth_range,  'b-', 
-                 label=f'Interpolated Spline ({dive_id})')
-        plt.gca().invert_yaxis()  # Inverts the y-axis so depth increases downwards
-        plt.xlabel('Depth (m)')
-        plt.ylabel('Sound Speed (m/s)')
-        plt.title(f'Sound Speed Profile for {dive_id}')
-        plt.xlim(1480, 1540)
-        plt.legend()
-        plt.show()
+    # if plot:
+    #     # Plotting
+    #     plt.figure(figsize=(3, 10))
+    #     plt.plot(dive_data_sorted['SoundSpeed_m_s'], 
+    #              dive_data_sorted['Depth_m'],  'ro', 
+    #              label=f'Original Data ({dive_id})')
+    #     plt.plot(sound_speed_interp, depth_range,  'b-', 
+    #              label=f'Interpolated Spline ({dive_id})')
+    #     plt.gca().invert_yaxis()  # Inverts the y-axis so depth increases downwards
+    #     plt.xlabel('Depth (m)')
+    #     plt.ylabel('Sound Speed (m/s)')
+    #     plt.title(f'Sound Speed Profile for {dive_id}')
+    #     plt.xlim(1480, 1540)
+    #     plt.legend()
+    #     plt.show()
         
     return pd.DataFrame({'Depth_m': depth_range, 'SoundSpeed_m_s': sound_speed_interp})
 ############################################################################
@@ -186,7 +286,7 @@ def interpolate_sound_speed(dive_data, maxDepth, plot =False):
 
 
 # Load a drift
-driftCTD = pd.read_csv("C:\\Users\\kaity\\Downloads\\sg639_MHI_Apr2023_CTD.csv")
+driftCTD = pd.read_csv("C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
 
 # Determine if the glider is ascending or descending
 depth_diff = np.diff(driftCTD['Depth_m'], prepend=np.nan)
@@ -204,12 +304,13 @@ else:
 
 # Define 'asc' for ascending and 'dec' for descending
 driftCTD['DiveID'] = driftCTD['DiveNumber'].astype(str) + '_' + driftCTD['Direction']
+#driftCTD['DiveID'] = driftCTD[driftCTD['DiveID']== '1_dec']
 
 # Figure out the distance between the lat/lon grid and the location of the 
 # drifter
 
 # Bathymetry data from NCEI
-nc_file = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
+nc_file = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
 ds = xr.open_dataset(nc_file)
 depth = ds['elevation'].values
 
@@ -232,7 +333,7 @@ bathymetry_df = pd.DataFrame({
 })
 
 results = {}
-for driftId, group in driftCTD.groupby('DiveID'): 
+for count, (driftId, group) in enumerate(driftCTD.groupby('DiveID'), start=2):
     
     drifter_lat =group['Latitude'].iloc[0]
     drifter_lon = group['Longitude'].iloc[0]
@@ -243,30 +344,35 @@ for driftId, group in driftCTD.groupby('DiveID'):
                                              bathymetry_df['lon'], bathymetry_df['lat'])
 
     # Filter to only points within 10 km
-    subset_df = bathymetry_df[bathymetry_df['distance_km'] <= 10]
+    subset_df = bathymetry_df[(bathymetry_df['distance_km'] <= 10) & 
+                                            (bathymetry_df['distance_km'] > 1.1)]
+    
+    # Temp for eval
+    #subset_df = subset_df.iloc[495:]
+    
     total_rows = len(subset_df)
     
     results[driftId] = []
     # Triangulate the scatter data
-    #triangulation = tri.Triangulation(bathymetry_df['lon'], bathymetry_df['lat'])
+    triangulation = tri.Triangulation(bathymetry_df['lon'], bathymetry_df['lat'])
     
-    # Create a filled contour plot using the depth values
-    #contour = plt.tricontourf(triangulation, bathymetry_df['depth'], levels=100, cmap='viridis')
-    # plt.colorbar(contour, label='Depth')
+    #Create a filled contour plot using the depth values
+    contour = plt.tricontourf(triangulation, bathymetry_df['depth'], levels=100, cmap='viridis')
+    plt.colorbar(contour, label='Depth')
     
-    # plt.xlabel('Longitude')
-    # plt.ylabel('Latitude')
-    # plt.title('Bathymetry and Drifter Subset Points')
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.title('Bathymetry and Drifter Subset Points')
     
-    # # Overlay the subset points (ignoring depth)
-    # plt.scatter(subset_df['lon'], subset_df['lat'], color='red',
-    #             label='Within 10 km')
+    # Overlay the subset points (ignoring depth)
+    plt.scatter(subset_df['lon'], subset_df['lat'], color='red',
+                label='Within 10 km')
     
-    # # Overlay the drifter Loc
-    # plt.scatter(drifter_lon, drifter_lat, color='yellow')
+    # Overlay the drifter Loc
+    plt.scatter(drifter_lon, drifter_lat, color='yellow')
     
-    # plt.legend()
-    # plt.show()
+    plt.legend()
+    plt.show()
     
  
     # Create a DataFrame for the SSP
@@ -296,14 +402,24 @@ for driftId, group in driftCTD.groupby('DiveID'):
     # Convert the profile DataFrame into the BELLHOP list of lists format
     ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
     
-    
-    # Now, for each grid location create the bellhop model
-    for ii in  range(len(subset_df)):
+
+    for ii in  np.arange(0,len(subset_df)):
+        print(ii)
         # Extract the bathymetry along the path using only the subset points
-        bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset(
-            subset_df, drifter_lat, drifter_lon, subset_df['lat'].iloc[ii],
-            subset_df['lon'].iloc[ii], 200
-        )
+        # bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset(
+        #     subset_df, drifter_lat, drifter_lon, subset_df['lat'].iloc[ii],
+        #     subset_df['lon'].iloc[ii], 200
+        # )
+        
+        bathy_vals, path_lon, path_lat, cumulative_distance = extract_bathymetry_from_subset_vectorized(
+            subset_df =subset_df, start_lat=drifter_lat, start_lon=drifter_lon, 
+            stop_lat=subset_df['lat'].iloc[ii], 
+            stop_lon=subset_df['lon'].iloc[ii], interval=200)
+        
+
+        
+        np.min(bathy_vals)
+        np.max(bathy_vals)
         
         bathy_grid = pd.DataFrame({'range':cumulative_distance*1000, 'depth_m': -bathy_vals })
         bathy_grid.drop_duplicates(inplace=True)
@@ -322,7 +438,7 @@ for driftId, group in driftCTD.groupby('DiveID'):
             bottom_absorption=0.1,
             bottom_soundspeed=5250,
             tx_depth=250,
-            frequency= 3000,
+            frequency= 10000,
             nbeams = 0,
             max_angle = 90,
             min_angle = -90
@@ -330,19 +446,20 @@ for driftId, group in driftCTD.groupby('DiveID'):
         
         # Receiver locations
         env['rx_range'] =bathy_grid['range'].iloc[-1]
+        env['rx_range'] = np.arange(0, bathy_grid['range'].iloc[-1], 20)
         env['rx_depth'] =np.arange(0, bathy_grid['depth_m'].iloc[-1], 50)
         tloss = pm.compute_transmission_loss(env, mode='incoherent')
         tlosDb = 20*np.log10(np.abs(tloss))
         
         
 
-        # Append a dictionary containing all the relevant data for this point.
-        results[driftId].append({
-            'lat': drifter_lat,
-            'lon': drifter_lon,
-            'transmission_loss': tlosDb,
-            'tl_depths':  env['rx_depth']  # The additional depths array
-        })
+        # # Append a dictionary containing all the relevant data for this point.
+        # results[driftId].append({
+        #     'lat': drifter_lat,
+        #     'lon': drifter_lon,
+        #     'transmission_loss': tlosDb,
+        #     'tl_depths':  env['rx_depth']  # The additional depths array
+        # })
         print(f"Processed {ii} of {total_rows} points.")
 
         
