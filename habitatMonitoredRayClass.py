@@ -64,6 +64,7 @@ class PropagationModelRunner:
         n_bearings:    int                                      =360,
         hyd_vert_m:      int                                      =50,
         bathy_interval_m:int                                    =100,
+        fixedDrifterDetph: float =                              None,
         debug:         bool                                     =False,
     ):
         """
@@ -93,6 +94,7 @@ class PropagationModelRunner:
         self.hyd_vert_m         = hyd_vert_m
         self.bathy_interval_m = bathy_interval_m
         self.debug            = debug
+        self.fixedDrifterDetph = fixedDrifterDetph
 
         # ------------------------- threading & BLAS limits -------------
         self.cores = cores or max(1, mp.cpu_count() - 2)
@@ -120,6 +122,7 @@ class PropagationModelRunner:
 
         step   = 360 / self.n_bearings        # angular increment
         angles = np.int16(np.arange(0, 360, step))
+        
 
         with ThreadPool(processes=self.cores) as pool:
             for dive_id in drift_ids:
@@ -127,12 +130,22 @@ class PropagationModelRunner:
                 if group.empty:
                     print(f"[skip] DiveID {dive_id!r} not found")
                     continue
+                
+                # If the drifet depth is set, use that otherwise take the first 
+                # drift detph in the 
+                if self.fixedDrifterDetph is not None:
+                    drifterDepth = self.fixedDrifterDetph
+                else:
+                    drifterDepth  =group['Depth_m'][group['Depth_m'].first_valid_index()] 
+
 
                 lat0, lon0 = group["Latitude"].iloc[0], group["Longitude"].iloc[0]
                 subset_df  = self._subset_bathy(lat0, lon0)
 
                 ssp_table  = self._build_ssp(group, subset_df["depth"].abs().max())
-                metadata   = dict(start_lat=lat0, start_lon=lon0, drifter_depth=100)
+                metadata   = dict(start_lat=lat0, 
+                                  start_lon=lon0, 
+                                  drifter_depth=100)
 
                 for f_hz in self.freq_khz:
                     
@@ -454,6 +467,17 @@ if __name__ == "__main__":
     # Raw csv of drift SSP data
     drift_csv_loc = "C:\\Users\\kaity\\Downloads\\sg639_MHI_Apr2023_CTD_test.csv"
 
+    # Run with fixed drifter depth
+    RunClass =PropagationModelRunner( gebco_nc =nc_file_loc,
+                           drift_csv =drift_csv_loc,
+                           h5_out = 'testClass.h5py',
+                           cores =2,
+                           freq_khz = (5000,),
+                           bathy_radius_km =3,
+                           n_bearings =4,
+                           fixedDrifterDetph = 100)
+    
+    # Run with starting depth
     RunClass =PropagationModelRunner( gebco_nc =nc_file_loc,
                            drift_csv =drift_csv_loc,
                            h5_out = 'testClass.h5py',
@@ -461,6 +485,7 @@ if __name__ == "__main__":
                            freq_khz = (5000,),
                            bathy_radius_km =3,
                            n_bearings =4)
+    
     RunClass.run()
                            
         # gebco_nc       : path to GEBCO NetCDF‑4 bathymetry
