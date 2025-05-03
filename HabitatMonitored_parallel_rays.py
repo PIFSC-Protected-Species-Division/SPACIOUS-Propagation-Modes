@@ -4,8 +4,36 @@ Created on Wed Apr  9 20:24:37 2025
 
 @author: kaity
 """
+
+# --- put these four lines at the VERY top, before any other imports -------------
 import os
-os.environ["OPENBLAS_NUM_THREADS"] = "16"   # or 1, 8 … anything ≤ 24
+#os.environ["OPENBLAS_NUM_THREADS"] = "16"   # or 1, 8 … anything ≤ 24
+# os.environ["OPENBLAS_NUM_THREADS"] = "3"
+# os.environ["OMP_NUM_THREADS"]      = "3"
+# os.environ["MKL_NUM_THREADS"]      = "3"
+
+# import os, multiprocessing
+# cores = 60
+# N_POOL = max(2, cores // 3)   # → 20
+# N_BLAS = 1
+
+# # apply globally
+# os.environ["OMP_NUM_THREADS"]      = str(N_BLAS)
+# os.environ["OPENBLAS_NUM_THREADS"] = str(N_BLAS)
+# os.environ["MKL_NUM_THREADS"]      = str(N_BLAS)
+
+import multiprocessing as mp
+
+cores  = 58           # or mp.cpu_count()
+N_POOL = cores        # → 60 parallel workers
+N_BLAS = 1            # each worker only spawns 1 BLAS thread
+
+for var in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS"):
+    os.environ[var] = str(N_BLAS)
+
+from multiprocessing.pool import ThreadPool   # import *after* setting env
+
+from operator import itemgetter   # a tiny bit faster than a lambda
 import numpy as np
 from geopy.distance import geodesic
 from geopy.point import Point
@@ -27,11 +55,12 @@ import pandas as pd
 from pyproj import Geod
 import time
 
-
+np.seterr(divide = 'ignore')
 # ------------------------------------------------------------------ #
 # Globals shared by all threads (ThreadPool → threads share memory)
 # ------------------------------------------------------------------ #
 bathy_full = None        # set once in main
+subset_df = None
 geod       = Geod(ellps='WGS84')
 
 def variable_rx_range(max_km, s0_km=0.2, s1_km=0.1, target_km=40):
@@ -303,10 +332,10 @@ def calcTL(subset_df, drifter_lat, drifter_lon, freq_hz, bearing_deg,
     #pm.check_env2d(env)
     #pm.plot_ssp(env)
     
-    t = time.time()
-    tloss = pm.compute_transmission_loss(env, mode='coherent')
-    elapsed = time.time() - t
-    tlosDb = 20 * np.log10(np.abs(tloss)+.01)
+    #t = time.time()
+    tloss = pm.compute_transmission_loss(env, mode='incoherent')
+    #elapsed = time.time() - t
+    tlosDb = 20 * np.log10(np.abs(tloss))
     #pm.plot_transmission_loss(tloss, env=env, clim=[-90,-30], width=900)
     
    
@@ -336,12 +365,12 @@ def calcTL(subset_df, drifter_lat, drifter_lon, freq_hz, bearing_deg,
     # 3.  Apply the mask (choose your favourite style)
     # ------------------------------------------
     tloss_masked = np.where(mask, np.nan, tlosDb)      # NaN-fill
-    tloss_masked = pd.DataFrame(tloss_masked)
+    tloss_masked = pd.DataFrame(np.round(tloss_masked,2))
     #pm.plot_transmission_loss(10**(tloss_masked/20), env=env, clim=[-60,-30], width=900)
    
  
     print(f'done! {ii}')
-    return(tloss_masked,env['rx_range'],  env['rx_depth'])
+    return(tloss_masked, env['rx_range'],  env['rx_depth'])
 
 def extract_bathymetry_along_ray_vectorized(
     subset_df: pd.DataFrame,
@@ -402,10 +431,11 @@ def extract_bathymetry_along_ray_vectorized(
     )
 
     # ------------------------------------------------ 3. CUMULATIVE RANGE (km)
-    start_point = Point(start_lat, start_lon)
-    range_km = np.array(
-        [geodesic(start_point, (lat, lon)).kilometers for lat, lon in zip(lats, lons)]
-    )
+    #start_point = Point(start_lat, start_lon)
+    # range_km = np.array(
+    #     [geodesic(start_point, (lat, lon)).kilometers for lat, lon in zip(lats, lons)]
+    # )
+    range_km = distances_m / 1000.0
 
     # ------------------------------------------------ 4. INTERPOLATE BATHYMETRY
     subset_points  = subset_df[["lat", "lon"]].values
@@ -431,7 +461,7 @@ def extract_bathymetry_along_ray_vectorized(
 # Worker for multiprocessing
 def _worker(args):
     (angle_deg,              # <- was “ii”, keeps the bearing / task-ID
-     subset_df,
+     #subset_df,
      drifter_lat,
      drifter_lon,
      freq_hz,
@@ -444,75 +474,76 @@ def _worker(args):
 
         
     bath_vals, lons, lats, r_km = extract_bathymetry_along_ray_vectorized(
-        subset_df       = subset_df,
-        start_lat       = drifter_lat,
-        start_lon       = drifter_lon,
-        bearing_deg     = angle_deg,
-        max_distance_km = max_distance_km,
-        interval        = interval_m)
-     
+    subset_df     = subset_df,   # your pre-filtered bathy points
+    start_lat     = drifter_lat,
+    start_lon     = drifter_lon,
+    bearing_deg   = angle_deg,            # NE-ish
+    max_distance_km = max_distance_km,          # 20 km ray
+    interval      = interval)            # sample every 50 m)
+    
+    
     bathy_grid = pd.DataFrame({'range': r_km * 1000, 
-                                'depth_m': -bath_vals})
-     
+                               'depth_m': -bath_vals})
+    
     bathy_grid.drop_duplicates(inplace=True)
     bathy_grid.sort_values('range', inplace=True)
     bathy_grid.loc[0, 'range'] = 0
     #plt.plot(bathy_grid['range'], -bathy_grid['depth_m'])
-     
+    
     # Trim the bathymetry grid to the first location that is less than 100m
     lastRow = np.where(bathy_grid['depth_m']<100)
-     
+    
     if lastRow[0].size>0:
-         lastRow = np.min(lastRow)
-         bathy_grid = bathy_grid.iloc[:lastRow]
-         #plt.plot(bathy_grid['range'], -bathy_grid['depth_m'])
+        lastRow = np.min(lastRow)
+        bathy_grid = bathy_grid.iloc[:lastRow]
+        #plt.plot(bathy_grid['range'], -bathy_grid['depth_m'])
+
     
-     
     bathy = bathy_grid.apply(lambda row: [row['range'], row['depth_m']], axis=1).tolist()
-     
+    
     # Check if the bearing line crosses an atol
-    
-    
+   
+
     # Create the enviornment -770 seconds to run 40km enviornment file, 77 hours
     # per dive. 177 seconds for 15km, 17 hours per dive.
-     
+    
     # If the recievers are only at 40km 181 sec. 25156 rows within 40km 1
     # 1194.91 hours per dive
     env = pm.create_env2d(
-         depth=bathy,
-         soundspeed=ssp,
-         bottom_density=2700,    # kg/m^3
-         bottom_absorption=0.1,
-         bottom_soundspeed=5250,
-         tx_depth=250,
-         frequency=freq_hz,
-         nbeams=0,
-         max_angle=90,
-         min_angle=-90
-     )
-     
-     
+        depth=bathy,
+        soundspeed=ssp,
+        bottom_density=2700,    # kg/m^3
+        bottom_absorption=0.1,
+        bottom_soundspeed=5250,
+        tx_depth=100,
+        frequency=freq_hz,
+        nbeams=0,
+        max_angle=90,
+        min_angle=-90
+    )
+    
+    
     # Set hydrophone range, linearly decreasing space and depth linearly spaced
     env['rx_range'] = variable_rx_range((bathy_grid['range'].iloc[-1])/1000)*1000
     env['rx_depth'] = np.arange(0, np.max(bathy_grid['depth_m']), hydVertSpacing)
-     
+    
     # Check the enviornment and set up hydrophones
     #pm.check_env2d(env)
     #pm.plot_ssp(env)
-     
-    t = time.time()
-    tloss = pm.compute_transmission_loss(env, mode='coherent')
-    elapsed = time.time() - t
-    tlosDb = 20 * np.log10(np.abs(tloss)+.01)
-    #pm.plot_transmission_loss(tloss, env=env, clim=[-90,-30], width=900)
-     
     
-     
+    #t = time.time()
+    tloss = pm.compute_transmission_loss(env, mode='incoherent')
+    #elapsed = time.time() - t
+    tlosDb = 20 * np.log10(np.abs(tloss))
+    #pm.plot_transmission_loss(tloss, env=env, clim=[-90,-30], width=900)
+    
+   
+    
     # ------------------------------------------
     # 1.  Interpolate seabed to the hydrophone ranges
     #     – convert km → m so units match
     # ------------------------------------------
-   
+
     rx_range_km  = env['rx_range']           # length = 369
     rx_depth_m   = env['rx_depth']           # length = 34   (positive-down)
     seabed_depth_neg = np.interp(env['rx_range'],
@@ -520,7 +551,7 @@ def _worker(args):
                                  bathy_grid['depth_m'].to_numpy(),   # y-coordinate (-m)
                                  left=np.nan, right=np.nan)        # NaN if out of bounds
     
-   
+
     # ------------------------------------------
     # 2.  Build a depth-vs-range mask
     # ------------------------------------------
@@ -533,9 +564,8 @@ def _worker(args):
     # 3.  Apply the mask (choose your favourite style)
     # ------------------------------------------
     tloss_masked = np.where(mask, np.nan, tlosDb)      # NaN-fill
-    tloss_masked = pd.DataFrame(tloss_masked)
-    #pm.plot_transmission_loss(10**(tloss_masked/20), env=env, clim=[-60,-30], width=900)
-   
+    tloss_masked = pd.DataFrame(np.round(tloss_masked,2))
+    #pm.plot_transmission_loss(10**(tloss_masked/20), env=env, clim=[-60,-30], width=900)   
    
     print(f'done! angle {angle_deg}')
     return (angle_deg, tloss_masked,rx_range_km,rx_depth_m )
@@ -591,66 +621,81 @@ if __name__ == "__main__":
         'lat': lat_mesh.flatten(),
         'lon': lon_mesh.flatten()})
     
+
     
-    freq_hz =10000
+    freq_hz = np.arange(5000, 35000, step =5000)
     
     
     # Existing partially written HF5 file
     unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
     
     
+    hydVertSpacing = 75
+    hydHorzSpacing = 100
+    interval = 100 #bathymetry spacing
+    
+    # Number of angles to run per bathymetry grid
+    nSteps = 360
+    stepInt = 360/nSteps
+    
+    
     # 2) loop from the third element onward (index 2, because Python is zero‑based)
-    for driftId in unique_ids[0:16]:
+    for driftId in unique_ids[13:]:
         # 3) pull out the corresponding group “on the fly”
         group = driftCTD[driftCTD['DiveID'] == driftId]
         print(driftId)
         
-        #if driftId not in hf['drift_01'].keys():
-        #if driftId == '1_dec':
-        if (1+1) ==2:   
-    
-            drifter_lat = group['Latitude'].iloc[0]
-            drifter_lon = group['Longitude'].iloc[0]
-            
-           
-            # Create a distance metric
-            bathy_full['distance_km'] = haversine(
-                drifter_lon, drifter_lat,
-                bathy_full['lon'], 
-                bathy_full['lat']
-            )
-            
-            # Pull out datapoints within 15k of the sensor 
-            subset_df = bathy_full[
-                (bathy_full['distance_km'] <= 40)]
-            
-            # # Downsample the datapoints by 1/3
-            # subset_df = subset_df[subset_df.index % 3 != 0]
-            # total_rows = len(subset_df)
+
+        drifter_lat = group['Latitude'].iloc[0]
+        drifter_lon = group['Longitude'].iloc[0]
         
+       
+        # Create a distance metric
+        bathy_full['distance_km'] = haversine(
+            drifter_lon, drifter_lat,
+            bathy_full['lon'], 
+            bathy_full['lat']
+        )
+        
+        # Pull out datapoints within 15k of the sensor 
+        subset_df = bathy_full[
+            (bathy_full['distance_km'] <= 40)]
+        
+        # # Downsample the datapoints by 1/3
+        # subset_df = subset_df[subset_df.index % 3 != 0]
+        # total_rows = len(subset_df)
     
-            # Create the SSP profile
-            profile = pd.DataFrame({
-                'depth': group['Depth_m'],
-                'ss':    group['SoundSpeed_m_s'] })
-            ()
-            profile.sort_values('depth', inplace=True)
-            profile.dropna(inplace=True)
-            profile.reset_index(drop=True, inplace=True)
-            profile.loc[0, 'depth'] = 0
+
+        # Create the SSP profile
+        profile = pd.DataFrame({
+            'depth': group['Depth_m'],
+            'ss':    group['SoundSpeed_m_s'] })
+        ()
+        profile.sort_values('depth', inplace=True)
+        profile.dropna(inplace=True)
+        profile.reset_index(drop=True, inplace=True)
+        profile.loc[0, 'depth'] = 0
+        
+        t = time.time()
+        # Only use the dive if the profile depth is more than 200m
+        if np.max(profile['depth'])>200:
             
-            # Only use the dive if the profile depth is more than 200m
-            if np.max(profile['depth'])>200:
+            # Iterate through the frequencies
+            for freq in freq_hz:
                 results = {}
                 results[driftId] = []
-    
+                t = time.time()
+
+                max_distance_km = (45000-freq)/1000
+               
+                    
                 print(f'Running dive Id {driftId}  at {freq_hz} kHz')
                 max_depth = np.max(np.abs(subset_df['depth']))
                 last_ss = profile.iloc[-1]['ss']
                 
                 
                 expanedProfile = pd.DataFrame(
-                    {'depth': np.arange(profile.iloc[-1]['depth']+1, max_depth+50, step =50),
+                    {'depth': np.arange(profile.iloc[-1]['depth']+10, max_depth+50, step =50),
                         'ss': np.repeat(last_ss,
                                         len(np.arange(profile.iloc[-1]['depth']+10, max_depth+50, step =50)))})
         
@@ -667,14 +712,10 @@ if __name__ == "__main__":
                                 'drifter_depth': 100}
                 txDepth = metadata['drifter_depth']
         
-
-                max_distance_km = 40 
-                hydVertSpacing = 75
-                hydHorzSpacing = 100
-                interval = 100 #bathymetry spacing
-        
+    
+    
                 # # For each bearing angle 
-                # for ii in np.arange(90,359, step =90):
+                # for ii in np.int16(np.arange(0, 359, step = stepInt)):
                 #     print(f'starting angle {ii}')
                 #     tlGrid, range_m, depth_m = calcTL(subset_df, drifter_lat, drifter_lon, freq_hz, 
                 #            ii, interval, hydVertSpacing, 
@@ -687,18 +728,23 @@ if __name__ == "__main__":
                 #         'angle':ii
                 #     })
                 # print(f"Processed {ii} of 360 {driftId}")
-
-                nSteps = 360
+    
+    
                 # Parallelize the Bellhop TL computations
                 tasks = [
-                    (angle, subset_df, drifter_lat, drifter_lon, freq_hz, ssp, txDepth,
+                    (angle, drifter_lat, drifter_lon, freq, ssp, txDepth,
                      maxRangekm, interval, hydVertSpacing)
-                    for angle in np.arange(0, 359, step = 1)]
-                                
-                with ThreadPool(processes=nWorkers) as pool:
+                    for angle in np.int16(np.arange(0, 360, step = stepInt))]
+                
+                with ThreadPool(processes=N_POOL) as pool:
                     for status, ii, payload in pool.imap_unordered(_safe_worker,
-                                                                   tasks,
-                                                                   chunksize=5):
+                                                   tasks,
+                                                   chunksize=2):
+                                
+                # with ThreadPool(processes=nWorkers) as pool:
+                #     for status, ii, payload in pool.imap_unordered(_safe_worker,
+                #                                                    tasks,
+                #                                                    chunksize=1):
                         if status == 'fail':
                             #                         ↓ or logging.warning(...)
                             print(f"❌  error at index {ii}: {payload}")
@@ -713,13 +759,22 @@ if __name__ == "__main__":
                             'transmission_loss': tloss_masked      # 2-D array (depth × range)
                         })
                         print(f"Processed {ii} of {nSteps} rays.")    
-
-            
+    
+    
+                # Reorder the results
+                # `results` is your existing list of dicts
+                # take just the inner dicts and put them in a list
+    
+                
                 save_dive_frequency(
-                 h5_path      = "Spacious_Hawaii_100m_rays.h5",
+                 h5_path      = "Spacious_Hawaii_100m_rays_v1.h5",
                  drift_id     = "01",
                  dive_id      = driftId,
-                 freq_khz     = freq_hz,
+                 freq_khz     = freq,
                  metadata     = metadata,
                  grid_results = results[driftId])
+                
+            elapsed = time.time() - t
+    
+            print(f' Dive {driftId} processed in {elapsed/60/90} hrs')
 
