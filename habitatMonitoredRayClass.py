@@ -81,6 +81,7 @@ class PropagationModelRunner:
         n_bearings     : how many rays per dive (0 – 359° inclusive)
         hyd_vert       : vertical spacing between rx depths  [m]
         bathy_interval_m: along‑track sampling interval      [m]
+        fixedDrifterDetph: optional int. Set a fixed drifter depth [m]
         debug          : if True, prints extra diagnostics
         """
         self.geod             = Geod(ellps="WGS84")
@@ -132,13 +133,13 @@ class PropagationModelRunner:
                     continue
                 
                 # If the drifet depth is set, use that otherwise take the first 
-                # drift detph in the 
+                # drift detph in the valid range
                 if self.fixedDrifterDetph is not None:
                     drifterDepth = self.fixedDrifterDetph
                 else:
                     drifterDepth  =group['Depth_m'][group['Depth_m'].first_valid_index()] 
 
-
+                # Pull out the subset of data around the drifter
                 lat0, lon0 = group["Latitude"].iloc[0], group["Longitude"].iloc[0]
                 subset_df  = self._subset_bathy(lat0, lon0)
 
@@ -148,7 +149,7 @@ class PropagationModelRunner:
                                   drifter_depth=100)
 
                 for f_hz in self.freq_khz:
-                    
+                    # Remember the parameters...
                     # angle_deg: float,
                     # lat0: float,
                     # lon0: float,
@@ -468,26 +469,30 @@ if __name__ == "__main__":
     drift_csv_loc = "C:\\Users\\kaity\\Downloads\\sg639_MHI_Apr2023_CTD_test.csv"
 
     # Run with fixed drifter depth
-    RunClass =PropagationModelRunner( gebco_nc =nc_file_loc,
-                           drift_csv =drift_csv_loc,
-                           h5_out = 'testClass.h5py',
-                           cores =2,
-                           freq_khz = (5000,),
-                           bathy_radius_km =3,
-                           n_bearings =4,
-                           fixedDrifterDetph = 100)
+    # RunClass =PropagationModelRunner( gebco_nc =nc_file_loc,
+    #                        drift_csv =drift_csv_loc,
+    #                        h5_out = 'testClass.h5py',
+    #                        cores =2,
+    #                        freq_khz = (5000,),
+    #                        bathy_radius_km =3,
+    #                        n_bearings =4,
+    #                        fixedDrifterDetph = 100)
     
     # Run with starting depth
     RunClass =PropagationModelRunner( gebco_nc =nc_file_loc,
                            drift_csv =drift_csv_loc,
-                           h5_out = 'testClass.h5py',
-                           cores =2,
-                           freq_khz = (5000,),
-                           bathy_radius_km =3,
-                           n_bearings =4)
+                           h5_out = 'testClass_variable_depth_360.h5py',
+                           cores =4,
+                           freq_khz = (2000,),
+                           bathy_radius_km =1,
+                           n_bearings =120,
+                           hyd_vert_m =100)
     
     RunClass.run()
                            
+        # """
+        # Parameters
+        # ----------
         # gebco_nc       : path to GEBCO NetCDF‑4 bathymetry
         # drift_csv      : glider CTD export with DiveID, Depth_m, SoundSpeed_m_s …
         # h5_out         : output HDF‑5 file for TL grids
@@ -495,7 +500,10 @@ if __name__ == "__main__":
         # cores          : how many worker threads to spawn
         # blas_threads   : how many threads each BLAS call may spawn (OMP/MKL/…)
         # bathy_radius_km: radius around the glider for bathy subset
+        # freq_dep_rad   : bool, whether to change the maximum eval range as with frequency
         # n_bearings     : how many rays per dive (0 – 359° inclusive)
         # hyd_vert       : vertical spacing between rx depths  [m]
         # bathy_interval_m: along‑track sampling interval      [m]
+        # fixedDrifterDetph: optional int. Set a fixed drifter depth [m]
         # debug          : if True, prints extra diagnostics
+        # """
