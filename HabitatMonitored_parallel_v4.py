@@ -7,6 +7,15 @@ Created on Wed Apr  9 20:24:37 2025
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "4"   # or 1, 8 … anything ≤ 24
 
+import multiprocessing as mp
+
+cores  = 58           # or mp.cpu_count()
+N_POOL = cores        # → 60 parallel workers
+N_BLAS = 1            # each worker only spawns 1 BLAS thread
+
+for var in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS"):
+    os.environ[var] = str(N_BLAS)
+
 
 import numpy as np
 from geopy.distance import geodesic
@@ -182,9 +191,6 @@ def save_dive_frequency(
         _dset("depth", dmat, chunks=(row_chunk, col_chunk))
         _dset("tl",    tlmat,    chunks=(row_chunk, col_chunk))
         
-
-
-
 def save_dive_frequency(
     h5_path: str,
     drift_id: str,
@@ -483,9 +489,6 @@ def calcTL(ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp):
         print(f'done! {ii}')
     return ii, tlosDb, arr, env['rx_depth']
 
-
-
-
 # Worker for multiprocessing
 def _worker(task):
     ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth = task
@@ -513,9 +516,9 @@ def _worker(task):
     env = pm.create_env2d(
         depth=bathy,
         soundspeed=ssp,
-        bottom_density=2700,    # kg/m^3
-        bottom_absorption=0.1,
-        bottom_soundspeed=5250,
+        bottom_density=1600,    # kg/m^3
+        bottom_absorption=0.2,
+        bottom_soundspeed=1600,
         tx_depth=drifter_depth,
         frequency=freq_hz,
         nbeams=0,
@@ -570,61 +573,59 @@ def _safe_worker(args):
         traceback.print_exc()
         return ('fail', ii, exc)
 
-
-############################################################################
-#%% Run the analysis
-
-# Determine the number of workers on the machine. Leave 2 cpus for sanity.
-nWorkers = multiprocessing.cpu_count()-3
-
-
-# Load a drift
-#driftCTD = pd.read_csv("C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
-driftCTD = pd.read_csv("C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
-
-# Determine if the glider is ascending or descending
-depth_diff = np.diff(driftCTD['Depth_m'], prepend=np.nan)
-driftCTD['Direction'] = np.where(depth_diff > 0, 'dec', 'asc')
-if depth_diff[1] > 0:
-    driftCTD.at[0, 'Direction'] = 'dec'
-else:
-    driftCTD.at[0, 'Direction'] = 'asc'
-
-# Define DiveID
-driftCTD['DiveID'] = driftCTD['DiveNumber'].astype(str) + '_' + driftCTD['Direction']
-
-# Bathymetry data from NCEI
-#nc_file = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
-nc_file = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
-ds = xr.open_dataset(nc_file)
-latvec = ds['lat'].values
-lonvec = ds['lon'].values
-depth2d = ds['elevation'].values
-lon_mesh, lat_mesh = np.meshgrid(lonvec, latvec)
-bathymetry_df = pd.DataFrame({
-    'depth': depth2d.flatten(),
-    'lat': lat_mesh.flatten(),
-    'lon': lon_mesh.flatten()})
-
-freq_hz =10000
-
-
-# Existing partially written HF5 file
-#hf = h5py.File('Spacious_Hawaii_250m_v1.h5', 'r')
-unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
-
-# 2) loop from the third element onward (index 2, because Python is zero‑based)
-for driftId in unique_ids[0:]:
-    # 3) pull out the corresponding group “on the fly”
-    group = driftCTD[driftCTD['DiveID'] == driftId]
-    print(driftId)
+if __name__ == "__main__":
+    ############################################################################
+    #%% Run the analysis
     
-
-    if (1+1) ==2:   
-
+    # Determine the number of workers on the machine. Leave 2 cpus for sanity.
+    nWorkers = multiprocessing.cpu_count()-3
+    
+    
+    # Load a drift
+    driftCTD = pd.read_csv("C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
+    #driftCTD = pd.read_csv("C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
+    
+    # Determine if the glider is ascending or descending
+    depth_diff = np.diff(driftCTD['Depth_m'], prepend=np.nan)
+    driftCTD['Direction'] = np.where(depth_diff > 0, 'dec', 'asc')
+    if depth_diff[1] > 0:
+        driftCTD.at[0, 'Direction'] = 'dec'
+    else:
+        driftCTD.at[0, 'Direction'] = 'asc'
+    
+    # Define DiveID
+    driftCTD['DiveID'] = driftCTD['DiveNumber'].astype(str) + '_' + driftCTD['Direction']
+    
+    # Bathymetry data from NCEI
+    nc_file = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
+    #nc_file = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
+    ds = xr.open_dataset(nc_file)
+    latvec = ds['lat'].values
+    lonvec = ds['lon'].values
+    depth2d = ds['elevation'].values
+    lon_mesh, lat_mesh = np.meshgrid(lonvec, latvec)
+    bathymetry_df = pd.DataFrame({
+        'depth': depth2d.flatten(),
+        'lat': lat_mesh.flatten(),
+        'lon': lon_mesh.flatten()})
+    
+    freq_hz =35000
+    
+    
+    # Existing partially written HF5 file
+    #hf = h5py.File('Spacious_Hawaii_250m_v1.h5', 'r')
+    unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
+    
+    # 2) loop from the third element onward (index 2, because Python is zero‑based)
+    for driftId in unique_ids[0:]:
+        # 3) pull out the corresponding group “on the fly”
+        group = driftCTD[driftCTD['DiveID'] == driftId]
+        print(driftId)
+        
+    
         drifter_lat = group['Latitude'].iloc[0]
         drifter_lon = group['Longitude'].iloc[0]
-        
+        drifter_depth = 100
       
         
         # Create the SSP profile
@@ -647,20 +648,17 @@ for driftId in unique_ids[0:]:
                 bathymetry_df['lon'], bathymetry_df['lat']
             )
             
-            # Pull out datapoints within 15k of the sensor and deeper than 20m
+            # Pull out datapoints within 40km of the sensor and the water is deeper than 150 m
             subset_df = bathymetry_df[
                 (bathymetry_df['distance_km'] <= 40) &
-                #(bathymetry_df['distance_km'] > 1.1) &
-                (bathymetry_df['depth'] < -150) 
-                
-            ]
+                (bathymetry_df['depth'] < -150)]
             
             
             # This is where we will get the propagation data from  
             bathy_full = subset_df        # set once in main
     
             # Downsample the datapoints by 1/20th
-            subset_df = subset_df[subset_df.index % 20 != 0] 
+            #subset_df = subset_df[subset_df.index % 20 != 0] 
             subset_df.reset_index(drop=True, inplace=True)
             
         
@@ -674,13 +672,13 @@ for driftId in unique_ids[0:]:
                 'depth': group['Depth_m'][group['Direction']== 'asc'],
                 'ss': group['SoundSpeed_m_s'][group['Direction']== 'asc']
             })
-
+    
             # Sort them by 'depth'
             profile.sort_values('depth', inplace=True)
             profile.dropna(axis=0, inplace=True)
             profile.reset_index(drop=True, inplace=True)  # Reset index after sorting
             
-
+    
             # 4) Make sure it stays sorted
             profile.sort_values('depth', inplace=True, ignore_index=True)
             
@@ -701,9 +699,7 @@ for driftId in unique_ids[0:]:
             # Convert the profile DataFrame into the BELLHOP list of lists format
             ssp = profile.apply(lambda row: [row['depth'], row['ss']], axis=1).tolist()
             
-            drifter_depth = 100
-            
-            
+    
             # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
             metadata = {'start_lat': drifter_lat,
                             'start_lon': drifter_lon,
@@ -712,7 +708,7 @@ for driftId in unique_ids[0:]:
             #for ii in np.arange(0, len(subset_df)):
             # for ii in np.arange(3):
             #    _, tlosDb,arr, rx_depths = calcTL(ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp)
-
+    
                
             #    results[driftId].append({
             #                'lat':               subset_df['lat'].iloc[ii],
@@ -737,7 +733,8 @@ for driftId in unique_ids[0:]:
     
             # Parallelize the Bellhop TL computations
             tasks = [
-                (ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth)
+                (ii, subset_df, bathy_full, drifter_lat, drifter_lon, 
+                 freq_hz, ssp, drifter_depth)
                 for ii in np.arange(0, len(subset_df))]
             
             
@@ -745,7 +742,7 @@ for driftId in unique_ids[0:]:
             with ThreadPool(processes=nWorkers) as pool:
                 for status, ii, payload in pool.imap_unordered(_safe_worker,
                                                                tasks,
-                                                               chunksize=5):
+                                                               chunksize=1):
                     if status == 'fail':
                         #                         ↓ or logging.warning(...)
                         print(f"❌  error at index {ii}: {payload}")
@@ -765,14 +762,14 @@ for driftId in unique_ids[0:]:
             
             elapsed = time.time() - t
             print(f'Dive {driftId} completed in {elapsed}')
-
+    
         
             save_dive_frequency(
-            h5_path      = "Spacious_Hawaii_100m_ArrArray_PCHIP.h5",
+            h5_path      = "Spacious_Hawaii_100m_ArrArray_PCHIP_35khz.h5",
             drift_id     = "01",
             dive_id      = driftId,
             freq_khz     = freq_hz,
             metadata     = metadata,
             grid_results = results[driftId])
-
-
+    
+    
