@@ -36,6 +36,9 @@ from geopy.point import Point
 from scipy.interpolate import griddata
 from pyproj import Geod
 import arlpy.uwapm as pm
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+
 #---------------------------------------------------------------------------
 # Create a Geod instance for vectorized geodesic computations.
 geod = Geod(ellps='WGS84')
@@ -48,7 +51,79 @@ subsetBathy= None
 ###############################################################################
 # haversine, calculate_initial_compass_bearing, extract_bathymetry_from_subset
 # extract_bathymetry_from_subset_vectorized, tl_incoherent_from_arrivals …
-#    ↳ (copy the full originals here – omitted for brevity)        
+#    ↳ (copy the full originals here – omitted for brevity)   
+
+def detect_transect_ends(lons, lats, eps=0.03, min_sep=5):
+    """
+    Single‐definition: RDP simplification + min‐index separation filter,
+    without using np.linalg.norm (uses np.hypot instead).
+
+    Parameters
+    ----------
+    lons, lats : 1D array‐like of float
+        Track coordinates.
+    eps : float
+        RDP tolerance in degrees (~0.03≈3 km).
+    min_sep : int
+        Minimum row‐index gap between kept points.
+
+    Returns
+    -------
+    List[int]
+        Sorted indices of “major bend” points.
+    """
+    pts = np.column_stack((lons, lats))
+    n = len(pts)
+
+    # start & end are always kept
+    idxs = {0, n - 1}
+    stack = [(0, n - 1)]
+
+    while stack:
+        first, last = stack.pop()
+        if last - first < 2:
+            continue
+
+        start = pts[first]
+        end   = pts[last]
+        seg   = end - start
+
+        # vector from start→each intermediate point
+        rel = pts[first:last+1] - start  # shape (last-first+1, 2)
+
+        # segment length via hypot
+        seg_len = np.hypot(seg[0], seg[1])
+
+        if seg_len == 0:
+            # all distances are just distance to start
+            dists = np.hypot(rel[:,0], rel[:,1])
+        else:
+            # perp distance = |cross(seg, rel)| / |seg|
+            # np.cross on 2D gives scalar z-component
+            cross_z = np.cross(seg, rel)    # shape (last-first+1,)
+            dists   = np.abs(cross_z) / seg_len
+
+        # ignore endpoints
+        dists[0] = dists[-1] = 0
+        rel_idx  = np.argmax(dists)
+
+        if dists[rel_idx] > eps:
+            idx = first + rel_idx
+            idxs.add(idx)
+            stack.append((first, idx))
+            stack.append((idx, last))
+
+    # apply min‐separation filter
+    raw      = sorted(idxs)
+    filtered = []
+    for i in raw:
+        if not filtered or i - filtered[-1] >= min_sep:
+            filtered.append(i)
+
+    return filtered
+
+
+
 
 def haversine(lon1, lat1, lon2, lat2):
     """
@@ -347,12 +422,41 @@ if __name__ == "__main__":
     driftCTD['DiveID'] = driftCTD['DiveNumber'].astype(str) + '_' + driftCTD['Direction']
     unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
     
+    
+    lons = driftCTD['Longitude'].values
+    lats = driftCTD['Latitude'].values
+    
+    ends = detect_transect_ends(lons, lats, eps=0.1, min_sep=5)
+    print("Transect-end indices:", ends)
+    
+    # Optional: plot to verify
+    fig, ax = plt.subplots(figsize=(8,6))
+    triang = tri.Triangulation(bathymetry_df['lon'], bathymetry_df['lat'])
+    ax.tricontourf(triang, bathymetry_df['depth'], levels=100, cmap='viridis')
+    ax.plot(lons, lats, '-k', zorder=5, label='Track')
+    ax.scatter(
+        lons[ends], lats[ends],
+        marker='*', s=150, facecolor='yellow', edgecolor='k',
+        zorder=10, label='Detected Ends'
+    )
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel('Longitude'); ax.set_ylabel('Latitude')
+    ax.legend(); plt.show()
+    
+    # Create a subset of the data based on the 
+    end_dive_nums = driftCTD['DiveNumber'].iloc[ends]
+    
+    # select every row whose DiveNumber is in that list
+    driftCTDsub = driftCTD[driftCTD['DiveNumber'].isin(end_dive_nums)]
+    
+
+    
     freq_hz =35000
     # ---------------------------------------------------------------- dive loop
-    for dive_id in driftCTD['DiveID'].unique():
+    for dive_id in driftCTDsub['DiveID'].unique():
         # ... (unchanged filtering to subset_df & ssp creation) ...
         # 3) pull out the corresponding group “on the fly”
-        group = driftCTD[driftCTD['DiveID'] == dive_id]
+        group = driftCTDsub[driftCTDsub['DiveID'] == dive_id]
         print(dive_id)
         
     
@@ -470,4 +574,4 @@ if __name__ == "__main__":
             dive_id      = dive_id,
             freq_khz     = freq_hz,
             metadata     = metadata,
-            grid_results = results[dive_id])
+            grid_results = results)
