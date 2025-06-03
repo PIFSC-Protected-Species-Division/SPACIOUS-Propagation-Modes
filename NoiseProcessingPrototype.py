@@ -66,7 +66,7 @@ binsize = 60.0
 # Select features of the files
 include_dirs = False
 zipped_files = False
-dc_subtract = False # subtract dc offset, useful for soundtraps
+dc_subtract = 1 # subtract dc offset, useful for soundtraps- must be 0 or 1 to write to netcdf
 
 asa_cal = pypam.ASA(
     hydrophone=drifter_Cal,
@@ -109,6 +109,9 @@ calibrated = frequency_increment["inc_value"].values+psd
 milli_psd_cal_dB_upa = milli_psd_cal.copy()
 milli_psd_cal_dB_upa["millidecade_bands"] = calibrated
 
+
+# Save the hybridmilidecade data...thing... (xarray) as a netcdf
+milli_psd_cal_dB_upa.to_netcdf(path='ExampleHubridMilliDecade.nc')
 
 # Plot the spectrum mean with the standard deviation
 pypam.plots.plot_spectrum_median(
