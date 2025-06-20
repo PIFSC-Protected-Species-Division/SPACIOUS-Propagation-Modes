@@ -71,6 +71,9 @@ def process_run(run_id, runIndex, depth_row, segment, fs, h5_path, dive_id):
     return runIndex, results
 
 
+##################
+# Plotting 
+######################
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -202,10 +205,154 @@ def scatter_peak2peak_3d(
     plt.tight_layout()
     plt.show()
 
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from pyproj import Transformer
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from scipy.interpolate import griddata, NearestNDInterpolator
+from skimage import measure
+
+def plot_peak2peak_isosurfaces(
+        lat, lon, depth_grid, pp_grid,
+        drifter_lat, drifter_lon,
+        iso_levels=(90,),             # peak-to-peak dB levels to draw
+        xy_res=200,
+        cmap=cm.viridis,
+        seabed_color='0.6',
+        elev=25, azim=-45
+):
+    # ------------------------------------------------------------------
+    # 1. lat/lon → UTM metres (drifter = 0,0)
+    # ------------------------------------------------------------------
+    utm_zone   = int((drifter_lon + 180) // 6) + 1
+    hemisphere = 'north' if drifter_lat >= 0 else 'south'
+    transformer = Transformer.from_crs(
+        "epsg:4326",
+        f"+proj=utm +zone={utm_zone} +{hemisphere} +datum=WGS84",
+        always_xy=True
+    )
+    x, y = transformer.transform(lon, lat)
+    x0, y0 = transformer.transform(drifter_lon, drifter_lat)
+    x, y   = x - x0, y - y0
+
+    # ------------------------------------------------------------------
+    # 2. Interpolate XY slices at each depth
+    # ------------------------------------------------------------------
+    xi = np.linspace(x.min(), x.max(), xy_res)
+    yi = np.linspace(y.min(), y.max(), xy_res)
+    X2d, Y2d = np.meshgrid(xi, yi)
+
+    z_vec = depth_grid[0, :]
+    Z = len(z_vec)
+    PP_vol = np.full((Z, xy_res, xy_res), np.nan, dtype=float)
+
+    for k in range(Z):
+        valid = np.isfinite(pp_grid[:, k])
+        if valid.sum() < 3:
+            continue
+
+        pts  = np.column_stack((x[valid], y[valid]))
+        vals = pp_grid[valid, k]
+
+        try:
+            PP_slice = griddata(pts, vals, (X2d, Y2d), method='cubic')
+        except Exception:
+            PP_slice = NearestNDInterpolator(pts, vals)(X2d, Y2d)
+
+        PP_vol[k] = PP_slice
+
+    # ------------------------------------------------------------------
+    # 3. TL range & marching-cubes prep
+    # ------------------------------------------------------------------
+    finite_vals = PP_vol[np.isfinite(PP_vol)]
+    if finite_vals.size == 0:
+        raise RuntimeError("No finite peak-to-peak values – check inputs")
+
+    real_min, real_max = finite_vals.min(), finite_vals.max()
+    nan_fill = real_min - 1.0
+
+    # ------------------------------------------------------------------
+    # 4. draw iso-surfaces
+    # ------------------------------------------------------------------
+    fig = plt.figure(figsize=(10, 8))
+    ax  = fig.add_subplot(111, projection='3d')
+    ax.set_facecolor('white')
+
+    for level in iso_levels:
+        if not (real_min < level < real_max):
+            print(f"⚠️  Skipping {level} dB – outside value range "
+                  f"[{real_min:.1f}, {real_max:.1f}] dB")
+            continue
+
+        try:
+            verts, faces, _, _ = measure.marching_cubes(
+                np.nan_to_num(PP_vol, nan=nan_fill),
+                level=level
+            )
+        except RuntimeError as e:
+            print(f"⚠️  marching_cubes failed for {level} dB: {e}")
+            continue
+
+        idx_x = np.clip(np.round(verts[:, 2]).astype(int), 0, xi.size - 1)
+        idx_y = np.clip(np.round(verts[:, 1]).astype(int), 0, yi.size - 1)
+        idx_z = np.clip(np.round(verts[:, 0]).astype(int), 0, Z - 1)
+
+        verts_xyz = np.empty_like(verts)
+        verts_xyz[:, 0] = xi[idx_x]
+        verts_xyz[:, 1] = yi[idx_y]
+        verts_xyz[:, 2] = z_vec[idx_z]
+
+        face_color = cmap((level - real_min) / (real_max - real_min))
+
+        ax.add_collection3d(
+            Poly3DCollection(verts_xyz[faces],
+                             facecolor=face_color,
+                             edgecolor='none',
+                             alpha=0.4)
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Seabed surface
+    # ------------------------------------------------------------------
+    seabed_raw = np.nanmax(depth_grid, axis=1)
+    valid_cols = np.isfinite(seabed_raw)
+
+    seabed_grid = griddata(
+        (x[valid_cols], y[valid_cols]), seabed_raw[valid_cols],
+        (X2d, Y2d),
+        method='linear',
+        fill_value=np.nan
+    )
+
+    R2d = np.sqrt(X2d**2 + Y2d**2)
+    seabed_grid[R2d > 15000] = np.nan
+    seabed_mask = np.ma.masked_invalid(seabed_grid)
+
+    ax.plot_surface(
+        X2d, Y2d, seabed_mask,
+        color=seabed_color,
+        alpha=0.6,
+        linewidth=0,
+        antialiased=False
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Axes & layout
+    # ------------------------------------------------------------------
+    ax.set_xlabel('East–West range (m)')
+    ax.set_ylabel('North–South range (m)')
+    ax.set_zlabel('Depth (m)')
+    ax.set_zlim(np.nanmax(seabed_raw), 0)
+    ax.set_title('3-D Peak-to-Peak Iso-Surfaces (dB re 1 µPa p-p)')
+    ax.view_init(elev=elev, azim=azim)
+
+    plt.tight_layout()
+    plt.show()
 
 
 
-
+#%%
 # --- Main Block ---
 if __name__ == "__main__":
     
@@ -233,6 +380,17 @@ if __name__ == "__main__":
     d_lat= dive_grp.parent.attrs['start_lat'] 
     d_lon= dive_grp.parent.attrs['start_lon'] 
     d_depth = dive_grp.parent.attrs['drifter_depth']
+    
+    
+    plot_peak2peak_isosurfaces(
+    lat=lat.ravel(),
+    lon=lon.ravel(),
+    depth_grid=depthGrid,
+    pp_grid=my_data,
+    drifter_lat=d_lat,
+    drifter_lon=d_lon,
+    iso_levels=(40,)  # e.g., 3 levels of pp dB
+)
     
     
     # Plot the peak to peak values
