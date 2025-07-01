@@ -818,7 +818,7 @@ if __name__ == "__main__":
     my_data = genfromtxt('PeakToPeakDive_dive_24_dec.csv', delimiter=',')
     np.nanmax(my_data)
     my_data[:, 1:4] = -500
-    my_data[:, 15:48] = -500
+    #my_data[:, 15:48] = -500
     
     # Now get the depths
     hf = h5py.File( 'Spacious_Hawaii_diveDepth_ArrArray_PCHIP_35khz_20km - Copy.h5', 'r')
@@ -871,7 +871,7 @@ if __name__ == "__main__":
     # Create a scatter plot of the detection probability from a birds-eye-view
     threshold = -60 # dB
     probabilities = plot_detection_probability(
-        my_data=corrected_data,
+        my_data=my_data,
         lat=lat,
         lon=lon,
         threshold_db=threshold,
@@ -879,8 +879,10 @@ if __name__ == "__main__":
         drifter_lon=d_lon
     )
     
+    
+    
     stats_df = plot_detection_vs_range(
-    my_data=corrected_data,
+    my_data=my_data,
     lat=lat,
     lon=lon,
     drifter_lat=d_lat,
@@ -898,7 +900,7 @@ if __name__ == "__main__":
     bearing_bin_width=10,
     range_bin_width_km=.25)
 
-#%%
+
     model_df = fit_and_plot_hazard_rate_by_location(
     my_data=my_data,
     lat=lat,
@@ -911,34 +913,8 @@ if __name__ == "__main__":
     )
 
     
-    # # Assuming `model_df` is already in memory
-    # range_km = model_df['range_km'].to_numpy()
-    # mean     = model_df['mean'].to_numpy()
-    # lower    = model_df['lower_95'].to_numpy()
-    # upper    = model_df['upper_95'].to_numpy()
     
-    # # Filter to finite CI values only
-    # valid_ci = np.isfinite(lower) & np.isfinite(upper)
-    
-    # # Plotting
-    # fig, ax = plt.subplots(figsize=(9, 6))
-    
-    # # CI ribbon
-    # ax.fill_between(range_km[valid_ci], lower[valid_ci], upper[valid_ci],
-    #                 color='blue', alpha=0.3, label='95% CI')
-        
-    
-    
-#     # Plot the peak to peak values
-#     scatter_peak2peak_3d(
-#     lat=lat,
-#     lon=lon,
-#     depth_grid=depthGrid,
-#     pp_grid=my_data,
-#     drifter_lat=d_lat,
-#     drifter_lon=d_lon,
-#     seabed_source="data"  # or "netcdf", bathy_nc="path/to/bathy.nc"
-# )
+   
     
     
     
