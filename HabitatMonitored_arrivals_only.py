@@ -5,7 +5,7 @@ Created on Wed Apr  9 20:24:37 2025
 @author: kaity
 """
 import os
-os.environ["OPENBLAS_NUM_THREADS"] = "4"   # or 1, 8 … anything ≤ 24
+os.environ["OPENBLAS_NUM_THREADS"] = "1"   # or 1, 8 … anything ≤ 24
 
 
 ###############################################################################
@@ -21,7 +21,7 @@ os.environ.update({
 # 2) ---- real processes, coarser chunks, no chatty prints --------------------
 from multiprocessing import Pool
 import multiprocessing as mp
-
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 from geopy.distance import geodesic
@@ -39,8 +39,8 @@ import h5py
 from multiprocessing.dummy import Pool as ThreadPool
 import time
 from multiprocessing import Pool
-from tqdm.auto import tqdm   # auto → pretty bar in notebooks & consoles
-
+#from tqdm.auto import tqdm   # auto → pretty bar in notebooks & consoles
+import os, h5py, numpy as np, pandas as pd
 
 
 
@@ -50,6 +50,107 @@ geod = Geod(ellps='WGS84')
 bathy_full = None        # set once in main
 subset_df = None
 subsetBathy= None
+
+###############################################################################
+# 2)  ––– original helper fns (unchanged) ------------------------------------
+###############################################################################
+# haversine, calculate_initial_compass_bearing, extract_bathymetry_from_subset
+# extract_bathymetry_from_subset_vectorized, tl_incoherent_from_arrivals …
+#    ↳ (copy the full originals here – omitted for brevity)   
+
+
+def get_completed_dive_ids(h5_path):
+    """
+    Returns a set of dive IDs already stored in the HDF5 file.
+    """
+    if not os.path.exists(h5_path):
+        return set()
+
+    with h5py.File(h5_path, "r") as hf:
+        if "drift_01" not in hf:
+            return set()
+        drift_grp = hf["drift_01"]
+        return set(drift_grp.keys())  # e.g. ['dive_001_asc', 'dive_002_dec']
+
+
+def _init_worker(subset_df, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth):
+    global _subset_df, _drifter_lat, _drifter_lon, _freq_hz, _ssp, _drifter_depth
+    _subset_df    = subset_df
+    _drifter_lat  = drifter_lat
+    _drifter_lon  = drifter_lon
+    _freq_hz      = freq_hz
+    _ssp          = ssp
+    _drifter_depth= drifter_depth
+    
+    
+def detect_transect_ends(lons, lats, eps=0.03, min_sep=5):
+    """
+    Single‐definition: RDP simplification + min‐index separation filter,
+    without using np.linalg.norm (uses np.hypot instead).
+
+    Parameters
+    ----------
+    lons, lats : 1D array‐like of float
+        Track coordinates.
+    eps : float
+        RDP tolerance in degrees (~0.03≈3 km).
+    min_sep : int
+        Minimum row‐index gap between kept points.
+
+    Returns
+    -------
+    List[int]
+        Sorted indices of “major bend” points.
+    """
+    pts = np.column_stack((lons, lats))
+    n = len(pts)
+
+    # start & end are always kept
+    idxs = {0, n - 1}
+    stack = [(0, n - 1)]
+
+    while stack:
+        first, last = stack.pop()
+        if last - first < 2:
+            continue
+
+        start = pts[first]
+        end   = pts[last]
+        seg   = end - start
+
+        # vector from start→each intermediate point
+        rel = pts[first:last+1] - start  # shape (last-first+1, 2)
+
+        # segment length via hypot
+        seg_len = np.hypot(seg[0], seg[1])
+
+        if seg_len == 0:
+            # all distances are just distance to start
+            dists = np.hypot(rel[:,0], rel[:,1])
+        else:
+            # perp distance = |cross(seg, rel)| / |seg|
+            # np.cross on 2D gives scalar z-component
+            cross_z = np.cross(seg, rel)    # shape (last-first+1,)
+            dists   = np.abs(cross_z) / seg_len
+
+        # ignore endpoints
+        dists[0] = dists[-1] = 0
+        rel_idx  = np.argmax(dists)
+
+        if dists[rel_idx] > eps:
+            idx = first + rel_idx
+            idxs.add(idx)
+            stack.append((first, idx))
+            stack.append((idx, last))
+
+    # apply min‐separation filter
+    raw      = sorted(idxs)
+    filtered = []
+    for i in raw:
+        if not filtered or i - filtered[-1] >= min_sep:
+            filtered.append(i)
+
+    return filtered
 
 def tl_incoherent_from_arrivals(arrivals,
                                 freqs_hz,
@@ -123,83 +224,6 @@ def tl_incoherent_from_arrivals(arrivals,
 
     return tl_maps, z_unique, r_unique
 
-def save_dive_frequency(
-        h5_path: str,
-        drift_id: str,
-        dive_id: str,
-        freq_khz: int,
-        metadata: dict,
-        grid_results: list,            # list of dicts from your thread pool
-        gzip_level: int = 4):
-    """
-    grid_results = [
-        {'lat': float,
-         'lon': float,
-         'transmission_loss': 1‑D np.array,
-         'tl_depths':         1‑D np.array},
-        ...
-    ]
-    """
-    # Number of grid pints 
-    n = len(grid_results)
-    max_N = max(len(g['tl_depths']) for g in grid_results)
-    arr_N = max(len(g['arr']) for g in grid_results)
-
-    # pre‑allocate and pad with NaNs
-    lat  = np.empty(n,              dtype=np.float32)
-    lon  = np.empty(n,              dtype=np.float32)
-    dmat = np.full((n, max_N), np.nan, dtype=np.float32)
-    tlmat= np.full((n, max_N), np.nan, dtype=np.float32)
-    arrmat= np.full((n, max_N), np.nan, dtype=np.float32)
-    vlen = np.empty(n, dtype=np.uint16)
-    
-    
-    for i, g in enumerate(grid_results):
-        k = len(g['tl_depths'])
-        lat[i] = g['lat']
-        lon[i] = g['lon']
-        arr[i] = g['arr']
-        dmat[i, :k]  = g['tl_depths']
-        tlmat[i, :k] = np.squeeze(np.round(g['transmission_loss'],2)) 
-        vlen[i] = k
-    
-    if not os.path.exists(h5_path):
-        print(f"[save_dive_frequency] creating new HDF5 file {h5_path}")
-    
-    with h5py.File(h5_path, "a") as hf:
-        fgrp = hf\
-            .require_group(f"drift_{drift_id}")\
-            .require_group(f"dive_{dive_id}")\
-            .require_group(f"frequency_{freq_khz}")
-
-        # save dive‑level attrs once
-        for k, v in metadata.items():
-            fgrp.parent.attrs[k] = v
-
-        # create or overwrite datasets
-        def _dset(name, data, **kw):
-            if name in fgrp:
-                del fgrp[name]
-            fgrp.create_dataset(
-                name,
-                data=data,
-                compression="gzip",
-                compression_opts=gzip_level,
-                chunks=kw.get("chunks"))
-
-        _dset("lat",  lat)
-        _dset("lon",  lon)
-        _dset("valid_len", vlen)
-        
-        # --- choose chunk dims: each <= data dims ---------------------
-        row_chunk = min(256, n)        # never exceed #rows
-        col_chunk = max_N              # always valid: max_N == depth.shape[1]
-        
-        _dset("depth", dmat, chunks=(row_chunk, col_chunk))
-        _dset("tl",    tlmat,    chunks=(row_chunk, col_chunk))
-
-
-import os, h5py, numpy as np, pandas as pd
 
 def save_dive_frequency(h5_path, drift_id, dive_id, freq_khz,
                         metadata, grid_results, gzip_level=4):
@@ -283,7 +307,87 @@ def save_dive_frequency(h5_path, drift_id, dive_id, freq_khz,
             # -----------------------------------
 
 
-    # done
+def save_dive_frequency(h5_path, drift_id, dive_id, freq_khz,
+                        metadata, grid_results, gzip_level=4):
+
+    # ─── unchanged pre-amble (lat/lon/TL matrices) ───
+    n_pts = len(grid_results)
+    max_N = max(len(np.asarray(g["tl_depths"]).reshape(-1)) for g in grid_results)
+
+    lat   = np.empty(n_pts, np.float32)
+    lon   = np.empty(n_pts, np.float32)
+    dmat  = np.full((n_pts, max_N), np.nan, np.float32)
+    tlmat = np.full((n_pts, max_N), np.nan, np.float32)
+    vlen  = np.empty(n_pts, np.uint16)
+
+    for i, g in enumerate(grid_results):
+        lat[i] = g["lat"]
+        lon[i] = g["lon"]
+
+        depths = np.asarray(g["tl_depths"]).reshape(-1)
+        tlvals = np.asarray(g["transmission_loss"]).reshape(-1)
+
+        k = depths.size
+        dmat[i, :k]  = depths
+        tlmat[i, :k] = np.round(tlvals, 2)
+        vlen[i] = k
+
+    # ─── open/create file ───
+    if not os.path.exists(h5_path):
+        print(f"[save_dive_frequency] creating new HDF5 file {h5_path}")
+
+    with h5py.File(h5_path, "a") as hf:
+        base = (
+            hf.require_group(f"drift_{drift_id}")
+              .require_group(f"dive_{dive_id}")
+              .require_group(f"frequency_{freq_khz}")
+        )
+
+        # one-time metadata
+        for k, v in metadata.items():
+            base.parent.attrs[k] = v
+
+        def _save(name, data, chunks=None):
+            if name in base:
+                del base[name]
+            base.create_dataset(name, data=data,
+                                compression="gzip",
+                                compression_opts=gzip_level,
+                                chunks=chunks)
+
+        row_chunk = min(256, n_pts)
+        _save("lat",        lat)
+        _save("lon",        lon)
+        _save("valid_len",  vlen)
+        _save("depth",      dmat, (row_chunk, max_N))
+        _save("tl",         tlmat, (row_chunk, max_N))
+
+        # ─── arrivals mini-tables ───
+        if "arrivals" in base:
+            del base["arrivals"]
+        arrivals_grp = base.create_group("arrivals")
+
+        for i, g in enumerate(grid_results):
+            arr_obj = g.get("arr", None)
+
+            # ---------- new handling ----------
+            if isinstance(arr_obj, pd.DataFrame) and not arr_obj.empty:
+                pt_grp = arrivals_grp.create_group(f"pt_{i:05d}")
+                for col in arr_obj.columns:
+                    pt_grp.create_dataset(
+                        name=col,
+                        data=arr_obj[col].to_numpy(copy=False),
+                        compression="gzip",
+                        compression_opts=gzip_level,
+                    )
+                pt_grp.attrs["row_index_name"] = arr_obj.index.name or ""
+                pt_grp.attrs["n_rows"] = len(arr_obj)
+            else:
+                # empty branch; keeps the mapping but stores no data
+                pt_grp = arrivals_grp.create_group(f"pt_{i:05d}")
+                pt_grp.attrs["n_rows"] = 0
+            # -----------------------------------
+
 def haversine(lon1, lat1, lon2, lat2):
     """
     Calculate the great circle distance between two points 
@@ -390,7 +494,6 @@ def interpolate_sound_speed(dive_data, maxDepth, plot=False):
     )
     return pd.DataFrame({'Depth_m': depth_range, 'SoundSpeed_m_s': sound_speed_interp})
 
-
 def checkEnv(ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp, bathy_interval =100):
     '''Function to check that all of the enviornmental parameters are set up
     correctly
@@ -487,16 +590,20 @@ def calcTL(ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp):
     return ii, tlosDb, arr, env['rx_depth']
 
 
+###############################################################################
+# 3)  ––– POOL HELPERS  
+###############################################################################
+
 # Worker for multiprocessing
 def _worker(task):
-    ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth = task
+    ii, subset_df, drifter_lat, drifter_lon, freq_hz, ssp, drifter_depth = task
     
     
     # If the minimum distane is less than 1km we need a different function that
     
     #print(f'Starting index {ii}')
     bathy_vals, path_lon, path_lat, cumulative_distance, actual_distance = extract_bathymetry_from_subset_vectorized(
-        subset_df=bathy_full,
+        subset_df=subset_df,
         start_lat=drifter_lat,
         start_lon=drifter_lon,
         stop_lat=subset_df['lat'].iloc[ii],
@@ -510,45 +617,29 @@ def _worker(task):
     bathy_grid.loc[0, 'range'] = 0
     bathy = bathy_grid.apply(lambda row: [row['range'], row['depth_m']], axis=1).tolist()
     
-    # Create the enviornment
     env = pm.create_env2d(
-        depth=bathy,
-        soundspeed=ssp,
-        bottom_density=1600,    # kg/m^3
-        bottom_absorption=0.2,
-        bottom_soundspeed=1600,
-        tx_depth=drifter_depth,
-        frequency=freq_hz,
-        nbeams=0,
-        max_angle=90,
-        min_angle=-90,
-        soundspeed_interp= 'pchip'
-    )
-    
-    # We need to set the receiver range to either the last location or the 
-    # location nearest to the actual range (in cases where the receiver is 
-    # closer than 1.1kms
-    if actual_distance<1.1:
-       indexer =  bathy_grid['depth_m'].index.get_indexer([actual_distance], method='nearest')
-       env['rx_range'] = actual_distance*1000
-       env['rx_depth'] = np.arange(0, indexer[0], 100)
+       depth=bathy,
+       soundspeed=ssp,
+       bottom_density=2700, # Bassalt zimmer pp33
+       bottom_absorption=0.1,
+       bottom_soundspeed=5250, # p- ~= sound wave 
+       tx_depth=drifter_depth,
+       frequency=freq_hz,
+       nbeams=0,
+       max_angle=90,
+       min_angle=-90,
+       soundspeed_interp='pchip')
+
+    if actual_distance < 1.1:
+       env['rx_range'] = actual_distance * 1000
+       env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[0], 100)
     else:
-        env['rx_range'] = bathy_grid['range'].iloc[-1]    
-        env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[-1], 100)
-    
-    # Check that the bathymetry doesn't have a seamount in front of it
-    # Check that there isn't a seamount in the way
-    minVal = bathy_grid['depth_m'].min()
-    if minVal <200:
-        #tlosDb =np.zeros(len(env['rx_depth']))/0
-        tlosDb = np.full(len(env['rx_depth']), np.nan)
-        arr = pd.DataFrame()
-    else:
-        #tloss = pm.compute_transmission_loss(env, mode='incoherent')
-        #tlosDb = 20 * np.log10(np.abs(tloss))
-        #tlosDb = np.zeros(len(env['rx_depth']))/0
-        tlosDb = np.full(len(env['rx_depth']), np.nan)
-        arr = pm.compute_arrivals(env)
+       env['rx_range'] = bathy_grid['range'].iloc[-1]
+       env['rx_depth'] = np.arange(0, bathy_grid['depth_m'].iloc[-1], 100)
+       
+   
+    arr = pm.compute_arrivals(env)
+    tlosDb = np.full(len(env['rx_depth']), np.nan) # omit for now
     
 
     #print(f'done! {ii}')
@@ -575,64 +666,90 @@ def _safe_worker(args):
         return ('fail', ii, exc)
 
 if __name__ == "__main__":
-    ############################################################################
-    #%% Run the analysis
-    
-    # Determine the number of workers on the machine. Leave 2 cpus for sanity.
-    nWorkers = mp.cpu_count()-4
-    #nWorkers = 50
-    
-    # Load a drift
-    driftCTD = pd.read_csv("C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
-    #driftCTD = pd.read_csv("C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv")
-    
-    # Determine if the glider is ascending or descending
-    depth_diff = np.diff(driftCTD['Depth_m'], prepend=np.nan)
-    driftCTD['Direction'] = np.where(depth_diff > 0, 'dec', 'asc')
-    if depth_diff[1] > 0:
-        driftCTD.at[0, 'Direction'] = 'dec'
-    else:
-        driftCTD.at[0, 'Direction'] = 'asc'
-    
-    # Define DiveID
-    driftCTD['DiveID'] = driftCTD['DiveNumber'].astype(str) + '_' + driftCTD['Direction']
-    
-    # Bathymetry data from NCEI
-    nc_file = 'C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
-    #nc_file = 'C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc'
-    ds = xr.open_dataset(nc_file)
-    latvec = ds['lat'].values
-    lonvec = ds['lon'].values
-    depth2d = ds['elevation'].values
-    lon_mesh, lat_mesh = np.meshgrid(lonvec, latvec)
-    bathymetry_df = pd.DataFrame({
-        'depth': depth2d.flatten(),
-        'lat': lat_mesh.flatten(),
-        'lon': lon_mesh.flatten()})
-    
-    freq_hz =35000
-    
-    # For sanity
-    lat_resolution = abs(latvec[1] - latvec[0])
-    lon_resolution = abs(lonvec[1] - lonvec[0])
-    print(f"Latitude resolution: {lat_resolution} degrees")
-    print(f"Longitude resolution: {lon_resolution} degrees")
-    
-    
-    # Existing partially written HF5 file
-    #hf = h5py.File('Spacious_Hawaii_250m_v1.h5', 'r')
-    unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
+   # ------------------------------------------------------------------ paths
+   drift_csv = r"C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\modelling\\sg639_MHI_Apr2023_CTD.csv"
+   gebco_nc  = r"C:\\Users\\pam_user\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\bathymetry\\GEBCO_28_Mar_2025_ade9db365e34\\gebco_2024_n23.5_s18.5_w-160.0_e-154.0.nc"
+   out_h5    = r"Spacious_Hawaii_diveDepth_ArrArray_PCHIP_35khz_20km.h5"
+
+   # ------------------------------------------------------------------- setup
+   nWorkers = max(1, mp.cpu_count() - 4)
+
+   driftCTD = pd.read_csv(drift_csv)
+   # ... (unchanged CTD preprocessing & profile/ssp build) ...
+
+   # build once outside the loop
+   ds = xr.open_dataset(gebco_nc)
+   bathymetry_df = pd.DataFrame({
+       'depth': ds['elevation'].values.flatten(),
+       'lat':   np.repeat(ds['lat'].values, len(ds['lon'])),
+       'lon':   np.tile(  ds['lon'].values, len(ds['lat']))})
+   
+   # Determine if the glider is ascending or descending
+   depth_diff = np.diff(driftCTD['Depth_m'], prepend=np.nan)
+   driftCTD['Direction'] = np.where(depth_diff > 0, 'dec', 'asc')
+   if depth_diff[1] > 0:
+       driftCTD.at[0, 'Direction'] = 'dec'
+   else:
+       driftCTD.at[0, 'Direction'] = 'asc'
+   
+   # Define DiveID
+   driftCTD['DiveID'] = driftCTD['DiveNumber'].astype(str) + '_' + driftCTD['Direction']
+   unique_ids = driftCTD['DiveID'].drop_duplicates().to_numpy()
+   
+   
+   lons = driftCTD['Longitude'].values
+   lats = driftCTD['Latitude'].values
+   
+   ends = detect_transect_ends(lons, lats, eps=0.1, min_sep=5)
+   
+   ends_new= ends[4:]
+   print("Transect-end indices:", ends)
+   
+   # # Optional: plot to verify
+   # fig, ax = plt.subplots(figsize=(8,6))
+   # triang = tri.Triangulation(bathymetry_df['lon'], bathymetry_df['lat'])
+   # ax.tricontourf(triang, bathymetry_df['depth'], levels=100, cmap='viridis')
+   # ax.plot(lons, lats, '-k', zorder=5, label='Track')
+   # ax.scatter(
+   #     lons[ends], lats[ends],
+   #     marker='*', s=150, facecolor='yellow', edgecolor='k',
+   #     zorder=10, label='Detected Ends'
+   # )
+   # ax.set_aspect('equal', adjustable='box')
+   # ax.set_xlabel('Longitude'); ax.set_ylabel('Latitude')
+   # ax.legend(); plt.show()
+   
+   # Create a subset of the data based on the 
+   end_dive_nums = driftCTD['DiveNumber'].iloc[ends_new]
+   
+   # select every row whose DiveNumber is in that list
+   driftCTDsub = driftCTD[driftCTD['DiveNumber'].isin(end_dive_nums)]
+   
+
+   
+   freq_hz =35000
+   
+   
+   completed_dives = get_completed_dive_ids(out_h5)
     
     # 2) loop from the third element onward (index 2, because Python is zero‑based)
-    for driftId in unique_ids[0:]:
+    
+   for dive_id in driftCTDsub['DiveID'].unique():
+        if f"dive_{dive_id}" in completed_dives:
+            print(f"Skipping completed dive {dive_id}")
+            continue
+           
+       
+       
         # 3) pull out the corresponding group “on the fly”
-        group = driftCTD[driftCTD['DiveID'] == driftId]
-        print(driftId)
+        group = driftCTD[driftCTD['DiveID'] == dive_id]
+        print(dive_id)
         
     
         drifter_lat = group['Latitude'].iloc[0]
         drifter_lon = group['Longitude'].iloc[0]
-        drifter_depth = 100
+        drifter_depth = np.max([-group['Depth_m'].iloc[0], 100])
+        #drifter_depth = 100
       
         
         # Create the SSP profile
@@ -648,7 +765,7 @@ if __name__ == "__main__":
         # Only use the dive if the profile depth is more than 200m
         if np.max(profile['depth'])>200:
             results = {}
-            results[driftId] = []
+            results[dive_id] = []
             
             bathymetry_df['distance_km'] = haversine(
                 drifter_lon, drifter_lat,
@@ -657,7 +774,7 @@ if __name__ == "__main__":
             
             # Pull out datapoints within 40km of the sensor and the water is deeper than 150 m
             subset_df = bathymetry_df[
-                (bathymetry_df['distance_km'] <= 40) &
+                (bathymetry_df['distance_km'] <= 20) &
                 (bathymetry_df['depth'] < -150)]
             
             
@@ -671,7 +788,7 @@ if __name__ == "__main__":
         
             total_rows = len(subset_df)
         
-            print(f'Running dive Id {driftId}  at {freq_hz} kHz')
+            print(f'Running dive Id {dive_id}  at {freq_hz} kHz')
             max_depth = np.max(np.abs(subset_df['depth']))
             last_ss = profile.iloc[-1]['ss']
             
@@ -691,12 +808,12 @@ if __name__ == "__main__":
             # Dictionary with keys 'start_lat', 'start_lon', and 'drifter_depth'.
             metadata = {'start_lat': drifter_lat,
                             'start_lon': drifter_lon,
-                            'drifter_depth': 100}
+                            'drifter_depth': drifter_depth}
             txDepth = metadata['drifter_depth']
             
     
             
-            # for ii in np.arange(0, len(subset_df)):
+            # # for ii in np.arange(0, len(subset_df)):
             # for ii in np.arange(3):
             #    _, tlosDb,arr, rx_depths = calcTL(ii, subset_df, bathy_full, drifter_lat, drifter_lon, freq_hz, ssp)
     
@@ -724,47 +841,64 @@ if __name__ == "__main__":
     
             # Parallelize the Bellhop TL computations
             tasks = [
-                (ii, subset_df, bathy_full, drifter_lat, drifter_lon, 
+                (ii, subset_df, drifter_lat, drifter_lon, 
                  freq_hz, ssp, drifter_depth)
                 for ii in np.arange(0, len(subset_df))]
             
             
             t = time.time()
-            with Pool(processes=nWorkers, maxtasksperchild=1) as pool:
-                for status, ii, payload in tqdm(
-                        pool.imap_unordered(_safe_worker, tasks, chunksize=1),
-                        total=len(tasks),
-                        desc="Bellhop jobs"):
             
+            # with ProcessPoolExecutor(
+            #         max_workers=nWorkers,
+            #         initializer=_init_worker,
+            #         initargs=(subset_df, ssp,
+            #                   drifter_lat, drifter_lon,
+            #                   freq_hz, txDepth,
+            #                   max_distance_km, interval_m,
+            #                   hydVertSpacing)) as pool:
+
+            # with ThreadPool(processes=nWorkers) as pool:
+            #     for status, ii, payload in pool.imap_unordered(_safe_worker, 
+            #                                                   tasks,
+            #                                                   chunksize=1):
+                    
+            with ProcessPoolExecutor(max_workers=nWorkers) as pool:
+                for status, ii, payload in pool.submit(_safe_worker, 
+                                                              tasks,
+                                                              chunksize=1):
+                    t = time.time()
                     if status == 'fail':
-                        tqdm.write(f"❌  index {ii} raised {payload!r}")   # ← ①
+                        #                         ↓ or logging.warning(...)
+                        print(f"❌  error at index {ii}: {payload}")
                         continue
             
                     # --------------- success path -----------------------
                     # payload is (ii, tlosDb, arr, rx_depths)
                     _, tlosDb, arr, rx_depths = payload                  # ← ②
             
-                    if ii % 50 == 0:
-                        tqdm.write(f"{ii}/{len(tasks)} points finished")  # tqdm-safe
+                    #if ii % 50 == 0:
+                     #   tqdm.write(f"{ii}/{len(tasks)} points finished")  # tqdm-safe
             
-                    results[driftId].append({
+                    results[dive_id].append({
                         'lat':  subset_df['lat'].iloc[ii],
                         'lon':  subset_df['lon'].iloc[ii],
                         'arr':  arr,
                         'transmission_loss': tlosDb,
                         'tl_depths': rx_depths
                     })
+                    print(f"Processed {ii} of {total_rows} points.") 
             
-            elapsed = time.time() - t
-            print(f'Dive {driftId} completed in {elapsed:.1f} s')
-                
-        
+                    
+                      
             save_dive_frequency(
-            h5_path      = "Spacious_Hawaii_100m_ArrArray_PCHIP_35khz.h5",
+            h5_path      = out_h5,
             drift_id     = "01",
-            dive_id      = driftId,
+            dive_id      = dive_id,
             freq_khz     = freq_hz,
             metadata     = metadata,
-            grid_results = results[driftId])
+            grid_results = results[dive_id])
+            
+            elapsed = time.time() - t
+            print(f'Dive {dive_id} completed in {elapsed:.1f} s')
     
     
