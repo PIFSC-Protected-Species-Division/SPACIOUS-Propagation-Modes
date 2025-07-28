@@ -51,12 +51,18 @@ bathy_full = None        # set once in main
 subset_df = None
 subsetBathy= None
 
+
+
 ###############################################################################
 # 2)  ––– original helper fns (unchanged) ------------------------------------
 ###############################################################################
 # haversine, calculate_initial_compass_bearing, extract_bathymetry_from_subset
 # extract_bathymetry_from_subset_vectorized, tl_incoherent_from_arrivals …
 #    ↳ (copy the full originals here – omitted for brevity)   
+
+# At global level
+_subset_df = None
+
 
 
 def get_completed_dive_ids(h5_path):
@@ -225,86 +231,6 @@ def tl_incoherent_from_arrivals(arrivals,
     return tl_maps, z_unique, r_unique
 
 
-def save_dive_frequency(h5_path, drift_id, dive_id, freq_khz,
-                        metadata, grid_results, gzip_level=4):
-
-    # ─── unchanged pre-amble (lat/lon/TL matrices) ───
-    n_pts = len(grid_results)
-    max_N = max(len(np.asarray(g["tl_depths"]).reshape(-1)) for g in grid_results)
-
-    lat   = np.empty(n_pts, np.float32)
-    lon   = np.empty(n_pts, np.float32)
-    dmat  = np.full((n_pts, max_N), np.nan, np.float32)
-    tlmat = np.full((n_pts, max_N), np.nan, np.float32)
-    vlen  = np.empty(n_pts, np.uint16)
-
-    for i, g in enumerate(grid_results):
-        lat[i] = g["lat"]
-        lon[i] = g["lon"]
-
-        depths = np.asarray(g["tl_depths"]).reshape(-1)
-        tlvals = np.asarray(g["transmission_loss"]).reshape(-1)
-
-        k = depths.size
-        dmat[i, :k]  = depths
-        tlmat[i, :k] = np.round(tlvals, 2)
-        vlen[i] = k
-
-    # ─── open/create file ───
-    if not os.path.exists(h5_path):
-        print(f"[save_dive_frequency] creating new HDF5 file {h5_path}")
-
-    with h5py.File(h5_path, "a") as hf:
-        base = (
-            hf.require_group(f"drift_{drift_id}")
-              .require_group(f"dive_{dive_id}")
-              .require_group(f"frequency_{freq_khz}")
-        )
-
-        # one-time metadata
-        for k, v in metadata.items():
-            base.parent.attrs[k] = v
-
-        def _save(name, data, chunks=None):
-            if name in base:
-                del base[name]
-            base.create_dataset(name, data=data,
-                                compression="gzip",
-                                compression_opts=gzip_level,
-                                chunks=chunks)
-
-        row_chunk = min(256, n_pts)
-        _save("lat",        lat)
-        _save("lon",        lon)
-        _save("valid_len",  vlen)
-        _save("depth",      dmat, (row_chunk, max_N))
-        _save("tl",         tlmat, (row_chunk, max_N))
-
-        # ─── arrivals mini-tables ───
-        if "arrivals" in base:
-            del base["arrivals"]
-        arrivals_grp = base.create_group("arrivals")
-
-        for i, g in enumerate(grid_results):
-            arr_obj = g.get("arr", None)
-
-            # ---------- new handling ----------
-            if isinstance(arr_obj, pd.DataFrame) and not arr_obj.empty:
-                pt_grp = arrivals_grp.create_group(f"pt_{i:05d}")
-                for col in arr_obj.columns:
-                    pt_grp.create_dataset(
-                        name=col,
-                        data=arr_obj[col].to_numpy(copy=False),
-                        compression="gzip",
-                        compression_opts=gzip_level,
-                    )
-                pt_grp.attrs["row_index_name"] = arr_obj.index.name or ""
-                pt_grp.attrs["n_rows"] = len(arr_obj)
-            else:
-                # empty branch; keeps the mapping but stores no data
-                pt_grp = arrivals_grp.create_group(f"pt_{i:05d}")
-                pt_grp.attrs["n_rows"] = 0
-            # -----------------------------------
 
 
 def save_dive_frequency(h5_path, drift_id, dive_id, freq_khz,
@@ -848,36 +774,19 @@ if __name__ == "__main__":
             
             t = time.time()
             
-            # with ProcessPoolExecutor(
-            #         max_workers=nWorkers,
-            #         initializer=_init_worker,
-            #         initargs=(subset_df, ssp,
-            #                   drifter_lat, drifter_lon,
-            #                   freq_hz, txDepth,
-            #                   max_distance_km, interval_m,
-            #                   hydVertSpacing)) as pool:
+                
 
-            # with ThreadPool(processes=nWorkers) as pool:
-            #     for status, ii, payload in pool.imap_unordered(_safe_worker, 
-            #                                                   tasks,
-            #                                                   chunksize=1):
-                    
             with ProcessPoolExecutor(max_workers=nWorkers) as pool:
-                for status, ii, payload in pool.submit(_safe_worker, 
-                                                              tasks,
-                                                              chunksize=1):
-                    t = time.time()
+                futures = [pool.submit(_safe_worker, task) for task in tasks]
+                
+                for future in as_completed(futures):
+                    status, ii, payload = future.result()
+            
                     if status == 'fail':
-                        #                         ↓ or logging.warning(...)
                         print(f"❌  error at index {ii}: {payload}")
                         continue
             
-                    # --------------- success path -----------------------
-                    # payload is (ii, tlosDb, arr, rx_depths)
-                    _, tlosDb, arr, rx_depths = payload                  # ← ②
-            
-                    #if ii % 50 == 0:
-                     #   tqdm.write(f"{ii}/{len(tasks)} points finished")  # tqdm-safe
+                    _, tlosDb, arr, rx_depths = payload
             
                     results[dive_id].append({
                         'lat':  subset_df['lat'].iloc[ii],
@@ -886,7 +795,9 @@ if __name__ == "__main__":
                         'transmission_loss': tlosDb,
                         'tl_depths': rx_depths
                     })
-                    print(f"Processed {ii} of {total_rows} points.") 
+            
+                    print(f"Processed {ii} of {total_rows} points.")
+
             
                     
                       
