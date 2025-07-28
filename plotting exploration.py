@@ -13,7 +13,7 @@ from pyproj import Transformer
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.interpolate import griddata, NearestNDInterpolator
 from scipy.spatial import QhullError
-from skimage import measure
+#from skimage import measure
 import h5py
 
 
@@ -321,7 +321,7 @@ def scatter_tl_3d(
 
 
 
-hf = h5py.File('Spacious_Hawaii_250m_v0.h5', 'r')
+hf = h5py.File('Spacious_Hawaii_100m_rays_v1.h5', 'r')
 diveIds = list(hf['drift_01'].keys())
 dive_grp = hf['drift_01'][diveIds[1]]['frequency_10000']
 tl = np.array(dive_grp['tl'])
@@ -352,3 +352,183 @@ plot_tl_isosurfaces(
     iso_levels=(-85,-87),
     elev=25, azim=140
 )
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 14 06:48:03 2025
+
+@author: kaity
+"""
+
+import numpy as np
+import pandas as pd
+
+def extract_monitored_area_points(tl, ang, rng, dep, tl_threshold_db):
+    """
+    Extracts the first (range, angle, depth) point where TL ≤ threshold,
+    for each angle and each depth index.
+
+    Parameters
+    ----------
+    tl : np.ndarray
+        Transmission loss array of shape [angle, depth, range]
+    ang : np.ndarray
+        Array of angles in degrees, shape [angle]
+    rng : np.ndarray
+        2D array of ranges [angle, range] or [1, range] if constant across angles
+    dep : np.ndarray
+        2D array of depths [angle, depth] or [1, depth] if constant across angles
+    tl_threshold_db : float
+        TL threshold in dB. Only include values ≤ this threshold.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['x', 'y', 'depth', 'bearing_deg']
+    """
+    rows = []
+
+    n_angles = tl.shape[0]
+    n_depths = tl.shape[1]
+
+    for a_idx in range(n_angles):
+        bearing = ang[a_idx]
+        theta_rad = np.deg2rad(bearing)
+
+        for d_idx in range(n_depths):
+            tl_line = tl[a_idx, d_idx, :]
+            valid = np.where(tl_line <= tl_threshold_db)[0]
+            if valid.size == 0:
+                continue  # no point meets threshold at this depth & angle
+
+            r_idx = valid[0]
+            r = rng[a_idx, r_idx] if rng.ndim == 2 else rng[0, r_idx]
+            z = dep[a_idx, d_idx] if dep.ndim == 2 else dep[0, d_idx]
+
+            x = r * np.cos(theta_rad)
+            y = r * np.sin(theta_rad)
+
+            rows.append((x, y, z, bearing))
+
+    df = pd.DataFrame(rows, columns=['x', 'y', 'depth', 'bearing_deg'])
+    return df
+
+
+df = extract_monitored_area_points(
+    tl=tl,
+    ang=ang,
+    rng=rng,
+    dep=dep,
+    tl_threshold_db=-90  # or whatever threshold you're using
+)
+
+# Quick 3D scatterplot
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+sc = ax.scatter(df['x'], df['y'], -df['depth'],  # depth as negative for z-down
+                c=df['bearing_deg'], cmap='hsv', s=10)
+ax.set_xlabel('X [m]')
+ax.set_ylabel('Y [m]')
+ax.set_zlabel('Depth [m]')
+ax.set_title('Monitored Area (TL ≤ threshold)')
+plt.colorbar(sc, label='Bearing (°)')
+plt.show()
+
+
+
+
+def generate_volume_from_scatter(df, tl, dep, rng, ang, dz=100):
+    """
+    Fill vertically from surface to each monitored point, clipped at seafloor from TL NaNs.
+    Returns a new dataframe of volume-filled points.
+    """
+    filled_points = []
+
+    for _, row in df.iterrows():
+        x, y, z, bearing = row['x'], row['y'], row['depth'], row['bearing_deg']
+        theta_idx = np.argmin(np.abs(ang - bearing))
+        r = np.sqrt(x**2 + y**2)
+        range_idx = np.argmin(np.abs(rng[0, :] - r))
+
+        # Ignore if using bad TL index (like at range=0)
+        if range_idx == 0:
+            continue
+
+        # Get max allowed depth from TL array (stop at first NaN)
+        tl_col = tl[theta_idx, :, range_idx]
+        if np.all(np.isnan(tl_col)):
+            continue
+        max_valid_idx = np.where(~np.isnan(tl_col))[0].max()
+        seafloor_depth = dep[0, max_valid_idx] if dep.ndim == 2 else dep[max_valid_idx]
+
+        # Fill down to the lesser of detection depth or seafloor
+        max_depth = min(z, seafloor_depth)
+        depths = np.arange(0, max_depth + dz, dz)
+
+        for dz_i in depths:
+            filled_points.append((x, y, dz_i, bearing))
+
+    df_vol = pd.DataFrame(filled_points, columns=['x', 'y', 'depth', 'bearing_deg'])
+    return df_vol
+
+
+df_vol = generate_volume_from_scatter(df, tl, dep, rng, ang, dz=100)
+
+# Plot filled volume
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+sc = ax.scatter(df_vol['x'], df_vol['y'], -df_vol['depth'],  # z-down
+                c=df_vol['bearing_deg'], cmap='hsv', s=4, alpha=0.1)  # alpha = transparency
+
+ax.set_xlabel('X [m]')
+ax.set_ylabel('Y [m]')
+ax.set_zlabel('Depth [m]')
+ax.set_title('Volume Monitored (TL ≤ threshold)')
+plt.colorbar(sc, label='Bearing (°)')
+plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+def voxelize_and_plot(df, dx=200, dy=200, dz=50):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    x, y, z = df['x'].values, df['y'].values, df['depth'].values
+
+    # Define voxel bin edges (one more than number of bins)
+    x_edges = np.arange(np.floor(x.min()), np.ceil(x.max()) + dx, dx)
+    y_edges = np.arange(np.floor(y.min()), np.ceil(y.max()) + dy, dy)
+    z_edges = np.arange(0, np.ceil(z.max()) + dz, dz)
+
+    # 3D histogram
+    hist, _ = np.histogramdd((x, y, z), bins=(x_edges, y_edges, z_edges))
+    voxels = hist > 0  # Boolean volume: (nx, ny, nz)
+
+    # Now generate voxel corner coordinates (edges!)
+    X, Y, Z = np.meshgrid(x_edges, y_edges, z_edges, indexing='ij')  # (nx+1, ny+1, nz+1)
+
+    # Plot
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.voxels(
+        X, Y, -Z,           # z-down
+        voxels,             # shape: (nx, ny, nz)
+        facecolors='dodgerblue',
+        edgecolors='gray',
+        linewidth=0.1,
+        alpha=0.25
+    )
+
+    ax.set_xlabel('X [m]')
+    ax.set_ylabel('Y [m]')
+    ax.set_zlabel('Depth [m]')
+    ax.set_title('Monitored Volume (voxelized)')
+    plt.show()
+
+voxelize_and_plot(df_vol, dx=200, dy=200, dz=50)

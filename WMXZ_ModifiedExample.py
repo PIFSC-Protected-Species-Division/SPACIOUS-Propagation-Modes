@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 def seawater_absorption(freq =1500,Z=0, T=5, S=35, pH=8):
     '''
-    Following Kinsler, et al "Fundamentals of Acoustics, Fourth Edition" p. 226-228.
+    Following KFC Sanders, et al "Fundamentals of Acoustics, Fourth Edition" p. 226-228.
 
     Parameters
     ----------
@@ -71,11 +71,26 @@ env = pm.create_env2d(
     bottom_absorption=0.1,
     frequency=freq,
     tx_depth=150,
-    nbeams=0)
-
+    nbeams=0,
+    soundspeed_interp= 'pchip')
 
 env['rx_range'] = HydRange
 env['rx_depth'] = 900 # again just let things scale
+
+env2 = pm.create_env2d(
+    depth=bathy,
+    soundspeed=ssp,
+    bottom_soundspeed=1250,
+    bottom_density=2700,
+    bottom_absorption=0.1,
+    frequency=freq/2,
+    tx_depth=150,
+    nbeams=0,
+    soundspeed_interp= 'pchip',
+    rx_range=  HydRange,
+    rx_depth=900)
+
+
 
 # for visualization of the geometry
 rays_eigen = pm.compute_eigenrays(env)
@@ -84,10 +99,21 @@ pm.pyplot_rays(rays_eigen)
 #pm.pyplot_rays(rays_all)
 
 arrivals = pm.compute_arrivals(env)
+plt.figure()
 pm.pyplot_arrivals(arrivals, dB=True)
 
 # time of first arrival
 to=np.min(arrivals['time_of_arrival'])
+
+
+arrivals2 = pm.compute_arrivals(env2)
+plt.figure()
+pm.pyplot_arrivals(arrivals2, dB=True)
+
+# time of first arrival
+to2=np.min(arrivals2['time_of_arrival'])
+
+
 
 # simulate Zc beaked whale click
 def zcSig(tt,f0,fm,aa,bb,cc):
@@ -119,6 +145,7 @@ print(f"RMS source level of simulated Zc click {src_lvl_ptp} dB re 1upa")
 fsamp=fs*1000
 
 ir = pm.arrivals_to_impulse_response(arrivals, fs=fsamp,abs_time=True)
+ir2 = pm.arrivals_to_impulse_response(arrivals2, fs=fsamp,abs_time=True)
 
 # for plotting define time vector and box on 'good' data
 time_ir=np.arange(len(ir))/fsamp
@@ -139,6 +166,8 @@ att = 10**((att_molecular+att_spherical)/20)
 
 
 dat=np.convolve(ss,ir)[:len(ir)]
+dat2=np.convolve(ss,ir)[:len(ir2)]
+
 xlim=[to-0.00025,to+0.0015]
 plt.plot(time_ir[stir], np.abs(ir[stir]))
 
@@ -166,7 +195,7 @@ plt.xlabel('Time (s)')
 plt.ylabel('Amplitude (units)')
 plt.xlim(xlim)
 
-
+#%% 
 # peak to peak calculations for the source
 ref_p2p = 20*np.log10(np.ptp(np.real(ss)/att)) # Ref: Source- sperhical and molecular
 rec_p2p = 20*np.log10(np.ptp(np.real(dat[stir]))) # Convolved ref
@@ -202,4 +231,51 @@ print(f"Observed attenuation {convolvAtt_rms} using convolution method rms"+
       f" at {HydRange/1000} km")
 
 
+#############################################################################
+# In our real audio file we do not have the complex component in time. 
+# Our options are to either create it or see if we can get convolution to run
+# using only the real part
+
+plt.plot(np.imag(ss))
+plt.plot(np.real(ss))
+plt.show()
+
+ss_real = np.real(ss)
+ir_real = np.abs(ir)
+
+
+dat_real=np.convolve(ss_real,ir_real)[:len(ir_real)]
+
+plt.figure()
+line1, = plt.plot(time_ir[stir], 
+                  (np.abs(ir_real[stir])), 
+                  label = 'Impulse response real only')
+
+line3, = plt.plot(to + tt/1000, 
+                  (ss_real/att), 
+                  label='Attenuated signal')
+
+line4, = plt.plot(time_ir[stir], 
+                 (dat_real[stir]), 
+                  label='Convolved signal')
+plt.legend()
+
+plt.title(f'Origional and Convolved Signals Run at {freq/1000} kHz')
+plt.xlabel('Time (s)')
+plt.ylabel('Amplitude (units)')
+plt.xlim(xlim)
+
+
+# Plot PSD
+plt.figure()
+plt.psd(ss_real, 256, 1/fs, label='Source')
+plt.psd(dat_real[stir], 256, 1/fs, label='Convolved Source')
+plt.psd((ss_real/att), 256, 1/fs, label='Attenuated signal')
+
+plt.ylabel('PSD(db)')
+plt.xlabel('Frequency')
+plt.legend()
+plt.title(f"PSD of signal at {np.round(HydRange/1000,1)} km",
+          fontsize = 14, fontweight ='bold')
+    
 

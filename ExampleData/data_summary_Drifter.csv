@@ -1,0 +1,2 @@
+deployment_name,instrument_name,instrument_sensitivity,instrument_amp,instrument_Vpp,folder_path,timezone,include_dirs,calibration,etn_id,method,instrument_depth,end_to_end_calibration
+station_1,CUSTOM,-172.8,0,2,C:\\Users\\kaity\\Documents\\GitHub\\SPACIOUS-Propagation-Modes\\ExampleData\GliderData,UTC,0,5,etn_test,drift,4,172.8

@@ -5,7 +5,9 @@ from scipy.signal import butter, filtfilt
 from scipy.signal.windows import tukey
 
 
-def tukeyClick(fs= 200000, dur_s=2.5, dbPtP = 205, padding_s =1, lfButter=4000,
+def tukeyClick(fs= 200000, dur_s=0.0012, 
+               dbPtP = 205, padding_s =1, 
+               lfButter=1000,
                hfButter = 60000, order =3,
                reference_pressure =1e-6):
     '''
@@ -182,6 +184,140 @@ def synthesize_received_broadband(arrSub, source, tx_depth, fs, td_thresh =1):
 
     return np.arange(n_out)/fs, y
 
+import numpy as np
+import pandas as pd
+from SourceLevel import tukeyClick, synthesize_received_broadband_incoh, plotTLSigs, synthesize_received_broadband
+
+import matplotlib.pyplot as plt
+import h5py 
+
+
+
+def sperm_whale_click_psd(source_level_dbpp, freq, plot=False,
+                           sample_rate=None, click_duration=None,
+                           click_type='usual', fs =200000):
+    """
+    Generate synthetic sperm whale click (usual, creak, or slow) based on
+    published spectral shapes from Madsen et al. (2002).
+    """
+
+    # Define click-specific parameters from Table 1
+    click_specs = {
+        'usual': {'fc': 15000, 'bw_10db': 19000, 'fs': 200000, 'dur': 0.0012},
+        'creak': {'fc': 15000, 'bw_10db': 17000, 'fs': 200000, 'dur': 0.001},
+        'slow':  {'fc': 3000,  'bw_10db': 4000,  'fs': 48000,  'dur': 0.005}
+    }
+
+    if click_type not in click_specs:
+        raise ValueError("click_type must be 'usual', 'creak', or 'slow'")
+
+    # Extract parameters
+    fc = click_specs[click_type]['fc']
+    bw = click_specs[click_type]['bw_10db']
+    sr = sample_rate or click_specs[click_type]['sr']
+    dur = click_duration or click_specs[click_type]['dur']
+
+    # Gaussian std to match -10 dB bandwidth
+    sigma = (bw / 2) / (np.sqrt(2 * np.log(10)))
+
+    N = int(sr * dur)
+    tukey_window = tukey(N)
+    
+    # Apply Butterworth bandpass filter (10-60 kHz)
+    nyquist = 0.5 * fs
+    low = lfButter / nyquist
+    high = hfButter / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    signal_filtered = filtfilt(b, a, signal_padded)
+    
+    if N % 2: N += 1  # make even
+    f = np.fft.rfftfreq(N, d=1/sr)
+
+    # Symmetric Gaussian envelope
+    envelope = np.exp(-0.5 * ((f - fc) / sigma)**2)
+
+    # Optional: shape tweaks for slow clicks (slightly skewed or non-Gaussian)
+    if click_type == 'slow':
+        envelope *= (1 - 0.1 * ((f - fc) / fc))  # taper slightly to low side
+
+    # # Random phase- Option 1
+    # phase = np.exp(2j * np.pi * np.random.rand(len(f)))
+    # spectrum = envelope * phase
+    ## Time-domain waveform
+    # click = np.fft.irfft(spectrum, n=N)
+    # from scipy.signal import minimum_phase
+    
+    # Use real-valued spectrum and convert to minimum-phase -option 2
+    from scipy.signal import minimum_phase
+    spectrum = envelope
+    impulse_response = np.fft.irfft(spectrum, n=N)
+    click = minimum_phase(impulse_response, method='hilbert')
+
+    
+    return psd_values, click
+import numpy as np
+from scipy.signal import hilbert
+
+def synthesize_received_porter(arr_sub,
+                               source,
+                               fs,
+                               atten=None,
+                               analytic_source=False):
+    """
+    Sidious & Porter-style received time series (Eqs. 3–4).
+
+    Parameters
+    ----------
+    arr_sub : DataFrame
+        Must contain 'time_of_arrival' [s] and 'arrival_amplitude' [complex].
+        One row per multipath.
+    source : 1-D ndarray
+        Source waveform *s(t)* at sampling rate *fs*.  Should be real-valued
+        unless you set analytic_source=True.
+    fs : float
+        Sampling rate [Hz].
+    atten : 1-D array or None
+        Linear attenuation factor per ray (same length as arr_sub).  Set this
+        to `apply_absorption(source, d, fs)` or leave as None to skip.
+    analytic_source : bool, default False
+        If True, `source` is already complex analytic and its own Hilbert
+        transform is `1j*source`.  Set False for the usual real click.
+
+    Returns
+    -------
+    t : ndarray  – time vector [s]
+    y : ndarray  – received pressure (real-valued)
+    """
+    tau   = arr_sub['time_of_arrival' ].to_numpy()                          # s
+    A     = arr_sub['arrival_amplitude'].to_numpy()                         # complex
+
+    if atten is not None:
+        A = A * atten                                                       # apply α(f,L)
+
+    # ------------------------------------------------------------------ prepare s(t) and s₊(t)
+    if analytic_source:
+        s   = source                                                        # already analytic
+        s_p = 1j * source                                                   # 90° shift
+    else:
+        s   = source                                                        # real click
+        s_p = hilbert(source)                                               # analytic companion
+
+    # both s and s_p are complex (analytic) at this point; we’ll extract real parts later
+
+    # ------------------------------------------------------------------ output buffer
+    k_idx = np.round(tau * fs).astype(int)                                  # sample shifts
+    n_out = k_idx.max() + len(source) + 1
+    y     = np.zeros(n_out, dtype=float)
+
+    # ------------------------------------------------------------------ shift-and-add (Eq. 4)
+    for idx, a in zip(k_idx, A):
+        re, im = a.real, a.imag
+        # s(t - τ) contribution
+        y[idx : idx+len(s)]   +=  re * np.real(s)   - im * np.real(s_p)
+        # NOTE: np.real(s) is just s if source was real; extra cast is cheap
+
+    return np.arange(n_out) / fs, y
+
 def tl_incoherent_from_arrivals(arrivals,
                                 freqs_hz,
                                 fc_design=None,
@@ -338,7 +474,7 @@ def synthesize_received_broadband_incoh(arrSub, source, tx_depth, fs, td_thresh)
     rx_depth = arr['rx_depth'].to_numpy()
     rx_depth= rx_depth[0]
     
-    # Arrivals, ranges, time delays
+    # Arrivals, ranges, t
     a = arr['arrival_amplitude'].to_numpy()
     r = np.array(np.sqrt(rx_range**2 +  (tx_depth - rx_depth**2)))
     k = np.round(tau * fs).astype(int)
@@ -371,24 +507,46 @@ def synthesize_received_broadband_incoh(arrSub, source, tx_depth, fs, td_thresh)
 #%% Do the thing
 
 if __name__ == "__main__":
-    clickSig,tt = tukeyClick(fs=200000)
+    
+    fs =200000
+    clickSig,tt = tukeyClick(fs=fs)
+    
+    # Try the porter version
+    t_rcv, rcv    = synthesize_received_porter(arrSub, 
+                                               clickSig, fs =fs)
 
-    # Time-domain plot
-    plt.subplot(2, 1, 1)
-    plt.plot(tt, clickSig)
-    plt.title('Time-Domain Waveform')
-    plt.xlabel('Time (ms)')
-    plt.ylabel('Amplitude (μPa)')
 
     # Frequency-domain plot
-    plt.subplot(2, 1, 2)
-    frequencies, power_spectral_density = plt.psd(clickSig, NFFT=1024, Fs=200000)
-    plt.title('Frequency-Domain Spectral Content')
+    plt.figure()
+    plt.subplot(2,2,1)
+    plt.plot(tt, clickSig)
+    plt.title('Initial Impulse')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (units)')
+    
+    
+    plt.subplot(2,2,3)
+    frequencies, power_spectral_density = plt.psd(clickSig, NFFT=1024, Fs=fs)
     plt.xlabel('Frequency (Hz)')
-    plt.ylabel('Power Spectral Density (dB/Hz)')
+    plt.ylabel('PSD  (dB/Hz)')
+    
+    plt.subplot(2,2,2)
+    plt.plot(t_rcv, rcv)
+    plt.title('Transformed Impulse')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (units)')
+    
+    
+    plt.subplot(2,2,4)
+    frequencies, power_spectral_density = plt.psd(rcv, NFFT=1024, Fs=fs)
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('')
 
-    plt.tight_layout()
+
     plt.show()
+    
+  
+
 
     from scipy.io import wavfile
     
